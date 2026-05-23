@@ -743,12 +743,6 @@ class TeamOrchestrator:
         review_provider_status = self._review_provider_status(preferred_review_provider)
         verdict_review_provider = preferred_review_provider if review_provider_status.available else "mock"
         runtime_review_provider = verdict_review_provider
-        if (
-            verdict_review_provider == "mock"
-            and self.runtime.__class__.__name__ == "CommandJobRuntime"
-            and hasattr(self.runtime, "adapters")
-        ):
-            runtime_review_provider = "claude" if "claude" in getattr(self.runtime, "adapters", {}) else verdict_review_provider
         session.structured_brief.provider_recommendation = _recommend_provider_runtime(
             self.runtime,
             reviewer_provider=verdict_review_provider,
@@ -784,7 +778,7 @@ class TeamOrchestrator:
             ),
         )
         review_result = _review_plan(requirement, session)
-        review_job = self.runtime.start(
+        review_job = self._start_job(
             JobRequest(
                 task_id=session.id,
                 provider=runtime_review_provider,
@@ -809,7 +803,7 @@ class TeamOrchestrator:
             review_result=review_result,
         )
         adversarial_result = _adversarial_review_plan(requirement, session)
-        adversarial_job = self.runtime.start(
+        adversarial_job = self._start_job(
             JobRequest(
                 task_id=session.id,
                 provider=runtime_review_provider,
@@ -1169,6 +1163,17 @@ class TeamOrchestrator:
             changed_files=changed_files,
         )
 
+    def retry_review(self, session_id: str) -> PlanSession:
+        return _team_retry_review(self, session_id)
+
+    def retry_adversarial_review(self, session_id: str) -> PlanSession:
+        return _team_retry_adversarial_review(self, session_id)
+
+    def _start_job(self, request: JobRequest) -> Any:
+        if request.provider == "mock" and not _runtime_supports_provider(self.runtime, "mock"):
+            return FileJobRuntime.start(self.runtime, request)
+        return self.runtime.start(request)
+
 
 def _merge_compliance_warning_snapshot(
     *,
@@ -1217,6 +1222,13 @@ def _select_retry_provider(session: PlanSession, runtime_status: Any) -> str:
     if isinstance(provider, str) and provider:
         return provider
     return "mock"
+
+
+def _runtime_supports_provider(runtime: JobRuntime, provider: str) -> bool:
+    adapters = getattr(runtime, "adapters", None)
+    if isinstance(adapters, dict):
+        return provider in adapters
+    return True
 
 
 def _reconcile_linked_execution_state(session: PlanSession, run_store: Any | None) -> PlanSession:
@@ -1544,7 +1556,7 @@ def _team_retry_review(self: TeamOrchestrator, session_id: str) -> PlanSession:
 
     review_provider = _select_retry_provider(session, runtime_status)
     review_result = _review_plan(session.requirement, session)
-    review_job = self.runtime.start(
+    review_job = self._start_job(
         JobRequest(
             task_id=session.id,
             provider=review_provider,
@@ -1613,7 +1625,7 @@ def _team_retry_adversarial_review(self: TeamOrchestrator, session_id: str) -> P
 
     review_provider = _select_retry_provider(session, runtime_status)
     adversarial_result = _adversarial_review_plan(session.requirement, session)
-    retry_job = self.runtime.start(
+    retry_job = self._start_job(
         JobRequest(
             task_id=session.id,
             provider=review_provider,
@@ -1670,11 +1682,6 @@ def _team_retry_adversarial_review(self: TeamOrchestrator, session_id: str) -> P
     session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
     self.store.write_session(session)
     return session
-
-
-TeamOrchestrator.retry_review = _team_retry_review
-TeamOrchestrator.retry_adversarial_review = _team_retry_adversarial_review
-
 
 def _review_plan(requirement: str, session: PlanSession) -> ReviewResult:
     lowered = requirement.lower()

@@ -654,7 +654,7 @@ def build_session_guidance(session: PlanSession) -> SessionGuidance:
         resume_action = "inspect_session"
         resume_reason = "compliance_warning_only"
         recovery_actions = ["inspect_compliance"]
-    elif delegated_job_failed and delegated_job_provider == "claude":
+    elif delegated_job_failed and _delegated_failure_supports_retry(session, delegated_job_provider):
         block_source = "delegated_job"
         if _has_failed_delegated_family(delegated_jobs, {"adversarial_review", "adversarial_review_retry"}):
             block_detail = "failed_adversarial_review_job"
@@ -668,7 +668,10 @@ def build_session_guidance(session: PlanSession) -> SessionGuidance:
             resume_action = "retry_review"
             resume_reason = "failed_review_job"
             recovery_actions = ["inspect_delegated_job", "retry_review", "revise_plan"]
-        primary_reason = "delegated job failed; inspect the failed Claude job before deciding whether to revise or retry"
+        if delegated_job_provider == "claude":
+            primary_reason = "delegated job failed; inspect the failed Claude job before deciding whether to revise or retry"
+        else:
+            primary_reason = "delegated job failed; inspect the failed job before deciding whether to revise or retry"
     elif delegated_job_failed:
         block_source = "delegated_job"
         block_detail = "failed_delegated_job"
@@ -891,6 +894,23 @@ def _has_failed_delegated_family(delegated_jobs: list[dict[str, object]], round_
     return any(
         str(job.get("round_type")) in round_types and str(job.get("status")) == "failed"
         for job in delegated_jobs
+    )
+
+
+def _delegated_failure_supports_retry(session: PlanSession, delegated_job_provider: str | None) -> bool:
+    if delegated_job_provider == "claude":
+        return True
+    structured_brief = getattr(session, "structured_brief", None)
+    recommendation = getattr(structured_brief, "provider_recommendation", {})
+    if not isinstance(recommendation, dict):
+        return False
+    reviewer = recommendation.get("reviewer")
+    fallback_from = recommendation.get("fallback_from")
+    return bool(
+        delegated_job_provider
+        and reviewer == delegated_job_provider
+        and fallback_from
+        and fallback_from != delegated_job_provider
     )
 
 

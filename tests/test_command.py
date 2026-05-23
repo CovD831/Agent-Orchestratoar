@@ -77,6 +77,38 @@ class SessionRunner(FakeRunner):
         return self.session
 
 
+class RaisingRunRunner:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.commands: list[list[str]] = []
+
+    def run(self, command: list[str], *, cwd: str, env: dict[str, str] | None = None) -> CommandResult:
+        self.commands.append(command)
+        raise self.exc
+
+
+class RaisingSpawnRunner(RaisingRunRunner):
+    def spawn(self, command: list[str], *, cwd: str, env: dict[str, str] | None = None) -> FakeSession:
+        self.commands.append(command)
+        raise self.exc
+
+
+class ExplodingSession(FakeSession):
+    def poll(self) -> CommandResult | None:
+        raise RuntimeError("poll boom")
+
+
+class ExplodingSessionRunner(SessionRunner):
+    def __init__(self) -> None:
+        FakeRunner.__init__(self, CommandResult(command=["fake"], exit_code=0, stdout="ok", stderr=""))
+        self.session = ExplodingSession(self.result)
+
+
+class ExplodingAdapter(CodexCliAdapter):
+    def parse_result(self, request: JobRequest, result: CommandResult) -> tuple[str, dict[str, object] | None, str | None]:
+        raise RuntimeError("parse boom")
+
+
 def test_command_job_runtime_completes_on_zero_exit(tmp_path) -> None:
     runner = FakeRunner(
         CommandResult(command=["fake"], exit_code=0, stdout="ok", stderr="")
@@ -164,6 +196,108 @@ def test_command_job_runtime_fails_on_missing_command(tmp_path) -> None:
     failed = runtime.status(job.id)
     assert failed.status == "failed"
     assert failed.error == "not found"
+
+
+def test_command_job_runtime_fails_when_run_raises_missing_binary(tmp_path) -> None:
+    runner = RaisingRunRunner(FileNotFoundError("codex not found"))
+    runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": CodexCliAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-12",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+        )
+    )
+
+    for _ in range(50):
+        if runtime.status(job.id).status == "failed":
+            break
+        time.sleep(0.01)
+
+    failed = runtime.status(job.id)
+    assert failed.status == "failed"
+    assert failed.stderr is not None
+    assert "FileNotFoundError" in failed.error
+    assert "FileNotFoundError" in failed.summary
+    assert "codex not found" in failed.stderr
+    assert runtime.result(job.id).status == "failed"
+
+
+def test_command_job_runtime_fails_when_spawn_raises(tmp_path) -> None:
+    runner = RaisingSpawnRunner(RuntimeError("spawn boom"))
+    runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": CodexCliAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-13",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+        )
+    )
+
+    assert job.status == "failed"
+    assert job.stderr is not None
+    assert "Failed to spawn provider command" in job.error
+    assert "spawn boom" in job.stderr
+
+
+def test_command_job_runtime_fails_when_background_poll_raises(tmp_path) -> None:
+    runner = ExplodingSessionRunner()
+    runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": CodexCliAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-14",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+        )
+    )
+
+    for _ in range(50):
+        if runtime.status(job.id).status == "failed":
+            break
+        time.sleep(0.01)
+
+    failed = runtime.status(job.id)
+    assert failed.status == "failed"
+    assert failed.stderr is not None
+    assert "poll boom" in failed.error
+    assert "RuntimeError" in failed.stderr
+
+
+def test_command_job_runtime_fails_when_finalize_raises(tmp_path) -> None:
+    runner = FakeRunner(
+        CommandResult(command=["fake"], exit_code=0, stdout="ok", stderr="")
+    )
+    runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": ExplodingAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-15",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+        )
+    )
+
+    for _ in range(50):
+        if runtime.status(job.id).status == "failed":
+            break
+        time.sleep(0.01)
+
+    failed = runtime.status(job.id)
+    assert failed.status == "failed"
+    assert failed.stderr is not None
+    assert "Failed to finalize provider command" in failed.error
+    assert "parse boom" in failed.stderr
 
 
 def test_command_job_runtime_cancel_marks_terminal(tmp_path) -> None:

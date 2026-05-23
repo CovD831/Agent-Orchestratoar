@@ -15,6 +15,7 @@ from agent_orchestrator.jobs import (
     FileJobRuntime,
     JobRequest,
     JobResult,
+    TERMINAL_STATUSES,
     Provider,
     now_iso,
     new_job_id,
@@ -384,8 +385,26 @@ class CommandJobRuntime(FileJobRuntime):
         self._update_index(job.id)
         self._append_log(job.id, f"starting: {' '.join(command_spec.command[:4])} ...")
 
-        session = self._spawn_session(command_spec.command, request.cwd, command_spec.env)
-        session_metadata = adapter.parse_session_metadata(request, session)
+        try:
+            session = self._spawn_session(command_spec.command, request.cwd, command_spec.env)
+        except Exception as exc:
+            return self._fail_job_from_exception(
+                job.id,
+                command_spec.command,
+                "Failed to spawn provider command",
+                exc,
+            ) or self._read_job(job.id)
+
+        try:
+            session_metadata = adapter.parse_session_metadata(request, session)
+        except Exception as exc:
+            return self._fail_job_from_exception(
+                job.id,
+                command_spec.command,
+                "Failed to read provider session metadata",
+                exc,
+            ) or self._read_job(job.id)
+
         if session is not None:
             with self._lock:
                 self._sessions[job.id] = session
@@ -471,14 +490,37 @@ class CommandJobRuntime(FileJobRuntime):
         session: ProviderSession | None,
     ) -> None:
         try:
-            if self.status(job_id).status in {"cancelled", "failed", "completed"}:
+            if self.status(job_id).status in TERMINAL_STATUSES:
                 return
 
-            command_result = self._wait_for_command(command_spec, request, session)
-            if self.status(job_id).status == "cancelled":
+            try:
+                command_result = self._wait_for_command(command_spec, request, session)
+            except Exception as exc:
+                command_result = _command_result_from_exception(
+                    command_spec.command,
+                    "Provider command failed before producing a result",
+                    exc,
+                )
+
+            if self.status(job_id).status in TERMINAL_STATUSES:
                 return
 
-            self._finalize_job(job_id, request, adapter, command_result)
+            try:
+                self._finalize_job(job_id, request, adapter, command_result)
+            except Exception as exc:
+                self._fail_job_from_exception(
+                    job_id,
+                    command_spec.command,
+                    "Failed to finalize provider command",
+                    exc,
+                )
+        except Exception as exc:
+            self._fail_job_from_exception(
+                job_id,
+                command_spec.command,
+                "Background command job failed",
+                exc,
+            )
         finally:
             with self._lock:
                 self._sessions.pop(job_id, None)
@@ -510,7 +552,15 @@ class CommandJobRuntime(FileJobRuntime):
                 job = replace(job, pid=int(pid), updated_at=now_iso())
                 self._write_job(job)
             if job.status == "running":
-                result = session.poll()
+                try:
+                    result = session.poll()
+                except Exception as exc:
+                    return self._fail_job_from_exception(
+                        job.id,
+                        job.command,
+                        "Provider session poll failed",
+                        exc,
+                    ) or self._read_job(job.id)
                 if result is not None and adapter is not None:
                     request = JobRequest(
                         task_id=job.task_id,
@@ -523,7 +573,15 @@ class CommandJobRuntime(FileJobRuntime):
                         sandbox=job.sandbox,
                         metadata=job.metadata,
                     )
-                    job = self._finalize_job(job.id, request, adapter, result)
+                    try:
+                        job = self._finalize_job(job.id, request, adapter, result)
+                    except Exception as exc:
+                        return self._fail_job_from_exception(
+                            job.id,
+                            job.command,
+                            "Failed to finalize provider command",
+                            exc,
+                        ) or self._read_job(job.id)
         return job
 
     def _finalize_job(
@@ -539,6 +597,8 @@ class CommandJobRuntime(FileJobRuntime):
         error = command_result.error or parse_error
         if command_result.exit_code not in (0, None) and not error:
             error = command_result.stderr.strip() or command_result.stdout.strip() or f"exit {command_result.exit_code}"
+        if failed and not summary:
+            summary = error or command_result.stderr.strip() or command_result.stdout.strip() or "Provider job failed."
 
         merged_payload = _merge_payload(current.parsed_payload, parsed_payload)
         if failed:
@@ -562,6 +622,42 @@ class CommandJobRuntime(FileJobRuntime):
             exit_code=command_result.exit_code,
             phase="done",
         )
+
+    def _fail_job_from_exception(
+        self,
+        job_id: str,
+        command: list[str],
+        context: str,
+        exc: Exception,
+    ) -> AgentJob | None:
+        message = _format_exception(context, exc)
+        payload = {
+            "exception": {
+                "context": context,
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "command": command,
+            }
+        }
+        try:
+            current = self._read_job(job_id)
+        except Exception:
+            return None
+        if current.status in TERMINAL_STATUSES:
+            return current
+        try:
+            return self.fail(
+                job_id,
+                summary=message,
+                error=message,
+                stdout="",
+                stderr=message,
+                raw_output="",
+                parsed_payload=_merge_payload(current.parsed_payload, payload),
+                exit_code=None,
+            )
+        except Exception:
+            return None
 
 
 def _provider_binary(provider: Provider) -> str:
@@ -592,3 +688,21 @@ def _merge_payload(current: dict[str, Any] | None, incoming: dict[str, Any] | No
     if incoming:
         merged.update(incoming)
     return merged
+
+
+def _command_result_from_exception(command: list[str], context: str, exc: Exception) -> CommandResult:
+    message = _format_exception(context, exc)
+    return CommandResult(
+        command=command,
+        exit_code=None,
+        stdout="",
+        stderr=message,
+        error=message,
+    )
+
+
+def _format_exception(context: str, exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return f"{context}: {type(exc).__name__}: {detail}"
+    return f"{context}: {type(exc).__name__}"
