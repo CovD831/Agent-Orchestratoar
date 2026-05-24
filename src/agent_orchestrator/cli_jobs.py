@@ -56,4 +56,9 @@ def print_job_cli_summary(command: str, payload: dict[str, object]) -> None:
     if metadata:
         terminal_ref = metadata.get("terminal_ref")
     suffix = f" terminal={terminal_ref}" if terminal_ref else ""
-    print(f"job_{command}: id={job_id} status={status} phase={phase}{suffix}{operation_suffix} summary={summary}")
+    last_seen = payload.get("updated_at") or payload.get("completed_at") or payload.get("started_at") or "unknown"
+    stdout = str(payload.get("stdout") or payload.get("raw_output") or "")
+    excerpt = " ".join(stdout.split())[:120] if stdout else ""
+    print(f"job_{command}: id={job_id} status={status} phase={phase}{suffix}{operation_suffix} last_seen={last_seen} summary={summary}")
+    if excerpt:
+        print(f"job_log_excerpt: {excerpt}")

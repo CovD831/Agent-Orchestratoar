@@ -2570,6 +2570,15 @@ def build_operator_runbook(session: PlanSession) -> list[str]:
         ]
 
     if session.status == "needs_revision":
+        if guidance.primary_action == "approve" and required_open == 0:
+            steps = [
+                f"Approve the reviewed plan with `{guidance.recommended_commands[0]}`.",
+                "Optional follow-up items can remain tracked without blocking approval.",
+                "After approval, run `team next` to retrieve the execution command.",
+            ]
+            if optional_open:
+                steps.insert(1, f"Review {optional_open} optional follow-up item(s) before approval if you want to promote them.")
+            return steps
         steps = [
             f"Close every required gap with `{guidance.recommended_commands[0]}`.",
             "Re-run `team summary` or `team next` to confirm approval is now allowed.",

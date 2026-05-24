@@ -126,7 +126,9 @@ def test_job_status_and_result_commands_round_trip(tmp_path, capsys) -> None:
         status_out = capsys.readouterr().out
         assert status_out.startswith("job_status:")
         assert "operation=already_terminal" in status_out
-        status_payload = json.loads("\n".join(status_out.splitlines()[1:]))
+        assert "last_seen=" in status_out
+        assert "job_log_excerpt: ok" in status_out
+        status_payload = json.loads("\n".join(status_out.splitlines()[2:]))
         assert status_payload["id"] == job.id
         assert "session_id" in status_payload
         assert "thread_id" in status_payload
@@ -137,7 +139,8 @@ def test_job_status_and_result_commands_round_trip(tmp_path, capsys) -> None:
         cli.main()
         result_out = capsys.readouterr().out
         assert result_out.startswith("job_result:")
-        result_payload = json.loads("\n".join(result_out.splitlines()[1:]))
+        assert "job_log_excerpt: ok" in result_out
+        result_payload = json.loads("\n".join(result_out.splitlines()[2:]))
         assert result_payload["job_id"] == job.id
         assert result_payload["summary"] == "cli done"
     finally:
@@ -246,7 +249,11 @@ def test_team_setup_reports_readiness_and_recommendations(capsys, tmp_path, monk
             format="pretty",
         )
         cli.main()
-        out = json.loads(capsys.readouterr().out)
+        output = capsys.readouterr().out
+        assert "setup: ready=yes release_ready=yes compliance=ok" in output
+        assert "providers: available=" in output
+        assert "release_checklist: version_sync=ok" in output
+        out = json.loads(output[output.index("{") :])
         assert out["provider_health"]["providers"]
         assert out["readiness"]["ready"] is True
         assert out["readiness"]["provider_states"]
@@ -254,6 +261,47 @@ def test_team_setup_reports_readiness_and_recommendations(capsys, tmp_path, monk
         assert out["release_readiness"]["checklist"]["version_sync"] is True
         assert out["release_readiness"]["evidence_state"]["benchmark_report_present"] is True
         assert out["recommended_commands"][0].endswith("team check-compliance")
+    finally:
+        cli._build_team_orchestrator = original_builder
+        cli.argparse.ArgumentParser.parse_args = original
+
+
+def test_team_setup_json_mode_remains_machine_readable(capsys, tmp_path, monkeypatch) -> None:
+    from agent_orchestrator import cli
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text('version = "0.1.0"\n', encoding="utf-8")
+    (tmp_path / "docs/process").mkdir(parents=True)
+    (tmp_path / "docs/process" / "v1x-evidence-report.md").write_text("# Stub\n", encoding="utf-8")
+    (tmp_path / "docs/process" / "v1x-evidence-trend.md").write_text("# Stub\n", encoding="utf-8")
+    (tmp_path / "docs/process" / "evidence-cases.json").write_text("[]", encoding="utf-8")
+
+    class FakeTeam:
+        def refresh_documentation_sync(self):
+            return {"missing_docs": [], "stale_docs": [], "header_contract_violations": []}
+
+        def check_compliance(self):
+            return {"blocking": False, "warnings": [], "blocking_reasons": [], "required_actions": [], "recommended_commands": []}
+
+    original = cli.argparse.ArgumentParser.parse_args
+    original_builder = cli._build_team_orchestrator
+    try:
+        cli._build_team_orchestrator = lambda *args, **kwargs: FakeTeam()
+        cli.argparse.ArgumentParser.parse_args = lambda self: cli.argparse.Namespace(
+            command="team",
+            team_command="setup",
+            plans_root=str(tmp_path / "plans"),
+            runs_root=str(tmp_path / "runs"),
+            jobs_root=str(tmp_path / "jobs"),
+            runtime="mock",
+            provider=None,
+            format="json",
+        )
+        cli.main()
+        output = capsys.readouterr().out
+        assert output.lstrip().startswith("{")
+        payload = json.loads(output)
+        assert payload["release_readiness"]["version_sync"]["package_version"] == "0.1.0"
     finally:
         cli._build_team_orchestrator = original_builder
         cli.argparse.ArgumentParser.parse_args = original
@@ -1539,6 +1587,41 @@ def test_team_runbook_command_reports_revision_workflow(tmp_path, capsys) -> Non
         assert "1. Close every required gap with `python -m agent_orchestrator.cli team revise" in out
         assert "2. Re-run `team summary` or `team next` to confirm approval is now allowed." in out
         assert "3. Use `team approve` only after required gaps are closed." in out
+    finally:
+        cli.argparse.ArgumentParser.parse_args = original
+
+
+def test_team_runbook_command_reports_approval_when_required_gaps_closed(tmp_path, capsys) -> None:
+    from agent_orchestrator import cli
+    from agent_orchestrator.planning import PlanStore, TeamOrchestrator
+
+    team = TeamOrchestrator(
+        orchestrator=Orchestrator(),
+        store=PlanStore(root=tmp_path / "plans"),
+    )
+    session = team.start("Build plan with followup checklist and recovery guidance")
+
+    original = cli.argparse.ArgumentParser.parse_args
+    try:
+        cli.argparse.ArgumentParser.parse_args = lambda self: cli.argparse.Namespace(
+            command="team",
+            team_command="runbook",
+            session_id=session.id,
+            requirement=None,
+            mode="success_first",
+            runtime="mock",
+            reroute="on",
+            provider=None,
+            agent=None,
+            depth=None,
+            plans_root=str(tmp_path / "plans"),
+            runs_root=str(tmp_path / "runs"),
+        )
+        cli.main()
+        out = capsys.readouterr().out
+        assert "next: approve" in out
+        assert "1. Approve the reviewed plan with `python -m agent_orchestrator.cli team approve" in out
+        assert "Close every required gap" not in out
     finally:
         cli.argparse.ArgumentParser.parse_args = original
 

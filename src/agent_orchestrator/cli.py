@@ -468,7 +468,10 @@ def main() -> None:
             )
             return
         if args.team_command == "setup":
-            print(json.dumps(_team_setup_snapshot(team, args), ensure_ascii=False, indent=2))
+            payload = _team_setup_snapshot(team, args)
+            if not _json_only(args):
+                _print_team_setup_summary(payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
             return
         if args.team_command == "inspect-execution":
             payload = team.inspect_execution(args.session_id)
@@ -808,6 +811,36 @@ def _team_setup_snapshot(team: TeamOrchestrator, args: argparse.Namespace) -> di
             "python -m agent_orchestrator.cli health --format json",
         ],
     }
+
+
+def _print_team_setup_summary(payload: dict[str, object]) -> None:
+    readiness = payload.get("readiness", {}) if isinstance(payload.get("readiness"), dict) else {}
+    release = payload.get("release_readiness", {}) if isinstance(payload.get("release_readiness"), dict) else {}
+    compliance = readiness.get("compliance_status", {}) if isinstance(readiness.get("compliance_status"), dict) else {}
+    provider_states = readiness.get("provider_states", []) if isinstance(readiness.get("provider_states"), list) else []
+    checklist = release.get("checklist", {}) if isinstance(release.get("checklist"), dict) else {}
+    available = [str(item.get("provider")) for item in provider_states if isinstance(item, dict) and item.get("available")]
+    unavailable = [
+        str(item.get("provider"))
+        for item in provider_states
+        if isinstance(item, dict) and not item.get("available")
+    ]
+    print(
+        "setup: "
+        f"ready={'yes' if readiness.get('ready') else 'no'} "
+        f"release_ready={'yes' if release.get('ready') else 'no'} "
+        f"compliance={'blocked' if compliance.get('blocking') else 'ok'}"
+    )
+    print(f"providers: available={','.join(available) if available else 'none'} unavailable={','.join(unavailable) if unavailable else 'none'}")
+    if checklist:
+        checklist_text = ", ".join(
+            f"{key}={'ok' if value else 'missing'}"
+            for key, value in checklist.items()
+        )
+        print(f"release_checklist: {checklist_text}")
+    commands = payload.get("recommended_commands", []) if isinstance(payload.get("recommended_commands"), list) else []
+    if commands:
+        print(f"next_command: {commands[0]}")
 
 
 def _build_release_readiness(
