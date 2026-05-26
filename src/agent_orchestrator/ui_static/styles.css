@@ -27,7 +27,7 @@ body {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-button, textarea { font: inherit; }
+button, textarea, select, input { font: inherit; }
 
 button {
   border: 1px solid var(--line);
@@ -50,14 +50,15 @@ h2 { font-size: 15px; }
 
 .console {
   display: grid;
-  grid-template-rows: 64px minmax(0, 1fr);
-  height: 100vh;
+  grid-template-rows: 68px minmax(0, 1fr);
+  height: 100dvh;
+  min-width: 980px;
 }
 
 .topbar {
   display: grid;
-  grid-template-columns: 190px minmax(0, 1fr) auto;
-  gap: 10px;
+  grid-template-columns: 220px minmax(0, 1fr) auto;
+  gap: 12px;
   align-items: center;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
@@ -73,7 +74,7 @@ h2 { font-size: 15px; }
 .top-summary {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);
   gap: 14px;
   align-items: center;
 }
@@ -86,7 +87,7 @@ h2 { font-size: 15px; }
 
 .mini-meta {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -111,17 +112,18 @@ h2 { font-size: 15px; }
 
 .board {
   display: grid;
-  grid-template-columns: 190px minmax(260px, 1fr) 270px;
-  gap: 10px;
+  grid-template-columns: 220px minmax(440px, 1fr) 340px;
+  gap: 12px;
   min-height: 0;
-  padding: 10px;
+  overflow: hidden;
+  padding: 12px;
 }
 
 .sidebar, .mission, .control { min-height: 0; }
 
 .sidebar, .control {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .sidebar { grid-template-rows: auto minmax(0, 1fr); }
@@ -144,6 +146,15 @@ textarea {
   min-width: 0;
 }
 
+select, input {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  min-width: 0;
+  color: var(--ink);
+  background: #fff;
+}
+
 .list, .job-list, .agent-grid {
   display: grid;
   gap: 8px;
@@ -158,7 +169,7 @@ textarea {
 
 .list {
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   align-content: start;
 }
 
@@ -184,8 +195,9 @@ textarea {
 
 .mission {
   display: grid;
-  grid-template-rows: 64px minmax(0, 1fr) 132px;
-  gap: 10px;
+  grid-template-rows: 72px minmax(320px, 1fr) minmax(128px, 22vh);
+  gap: 12px;
+  overflow: hidden;
 }
 
 .timeline,
@@ -265,8 +277,9 @@ textarea {
 
 .agent-grid {
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   align-content: start;
+  padding-right: 4px;
 }
 
 .role-group {
@@ -292,9 +305,9 @@ textarea {
 .role-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  grid-auto-rows: 128px;
+  grid-auto-rows: minmax(126px, auto);
   gap: 8px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .agent-card {
@@ -374,8 +387,9 @@ textarea {
 
 .job-list {
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  grid-auto-rows: 92px;
-  overflow: hidden;
+  grid-auto-rows: minmax(92px, auto);
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .job-item {
@@ -386,14 +400,28 @@ textarea {
   min-width: 0;
 }
 
+.job-item.active {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 .control {
-  grid-template-rows: auto 150px minmax(140px, 1fr) 130px;
+  align-content: start;
+  grid-auto-rows: max-content;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .next-action, .panel {
   padding: 10px;
   min-width: 0;
   min-height: 0;
+}
+
+.panel {
+  display: grid;
+  gap: 8px;
 }
 
 .next-action {
@@ -518,6 +546,36 @@ textarea {
   gap: 8px;
 }
 
+.agent-config-panel {
+  overflow: visible;
+}
+
+.agent-config-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.agent-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+  gap: 8px;
+}
+
+.field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field textarea {
+  min-height: 96px;
+  max-height: 180px;
+  overflow: auto;
+}
+
 .compact-actions {
   align-items: center;
   margin-bottom: 8px;
@@ -526,10 +584,10 @@ textarea {
 .runbook {
   margin: 8px 0 0;
   padding-left: 20px;
-  overflow: hidden;
+  overflow: auto;
   font-size: 13px;
   line-height: 1.35;
-  max-height: 110px;
+  max-height: 180px;
 }
 
 .json-view, .log-view {
@@ -537,11 +595,17 @@ textarea {
   color: #d7e2ee;
   border-radius: 8px;
   padding: 10px;
-  overflow: hidden;
+  overflow: auto;
   white-space: pre-wrap;
   font-size: 12px;
   line-height: 1.35;
-  height: calc(100% - 96px);
+  min-height: 150px;
+  max-height: 280px;
+}
+
+.log-view {
+  min-height: 180px;
+  max-height: 360px;
 }
 
 .decision-panel { min-height: 0; }
@@ -582,8 +646,13 @@ textarea {
   .console {
     height: auto;
     min-height: 100vh;
+    min-width: 0;
   }
   .topbar, .board, .top-summary { grid-template-columns: 1fr; }
-  .board, .mission, .control { min-height: auto; }
+  .board, .mission, .control {
+    min-height: auto;
+    overflow: visible;
+  }
+  .mission { grid-template-rows: auto; }
   .timeline, .job-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

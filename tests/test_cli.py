@@ -15,7 +15,30 @@ from agent_orchestrator.cli import _print_run_summary
 from agent_orchestrator.jobs import FileJobRuntime, JobRequest
 from agent_orchestrator.orchestrator import Orchestrator
 from agent_orchestrator.routing import PolicyRouter
-from test_support import write_minimal_process_docs
+from test_support import start_reviewed_session, write_minimal_process_docs
+
+
+def _cli_session(team, requirement: str):
+    session = start_reviewed_session(team, requirement)
+    lowered = requirement.lower()
+    if "architecture direction" in lowered:
+        session.status = "awaiting_human"
+        session.resume.current_phase = "awaiting_human"
+        session.resume.pending_role = "human"
+        team.store.write_session(session)
+    elif "auth migration" in lowered and "roadmap drift" in lowered:
+        session.status = "blocked"
+        session.resume.current_phase = "blocked"
+        session.resume.pending_role = "human"
+        team.store.write_session(session)
+    elif session.gaps:
+        session.status = "needs_revision"
+        session.resume.current_phase = "in_review"
+        session.resume.pending_role = "lead"
+        team.store.write_session(session)
+    elif session.status != "approved_for_execution":
+        session = team.approve(session.id)
+    return session
 
 
 class _FakeClaudeRunner:
@@ -52,6 +75,7 @@ def test_provider_health_snapshot_includes_mock_binary_and_fallback_fields() -> 
     providers = {item["provider"]: item for item in payload["providers"]}
 
     assert payload["cache"]["tiers"] == ["memory", "disk", "live"]
+    assert {item["mode"] for item in payload["runtime_modes"]} == {"cli_inherit", "cli_isolated", "direct_api"}
     assert {"codex", "claude", "mock"} <= set(providers)
     assert "binary" in providers["codex"]
     assert "recommended_fallback" in providers["claude"]
@@ -252,9 +276,13 @@ def test_team_setup_reports_readiness_and_recommendations(capsys, tmp_path, monk
         output = capsys.readouterr().out
         assert "setup: ready=yes release_ready=yes compliance=ok" in output
         assert "providers: available=" in output
+        assert "runtime_modes: " in output
         assert "release_checklist: version_sync=ok" in output
         out = json.loads(output[output.index("{") :])
         assert out["provider_health"]["providers"]
+        assert out["runtime_modes"]
+        assert out["role_profiles"]
+        assert {profile["runtime_mode"] for profile in out["role_profiles"]} >= {"cli_inherit", "direct_api"}
         assert out["readiness"]["ready"] is True
         assert out["readiness"]["provider_states"]
         assert out["release_readiness"]["version_sync"]["package_version"] == "1.0.0rc1"
@@ -609,7 +637,7 @@ def test_team_status_command_round_trips_session(tmp_path, capsys) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -646,7 +674,7 @@ def test_team_resume_command_normalizes_session_state(tmp_path, capsys) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
     session.resume.current_phase = "drafting"
     session.resume.pending_role = "build"
     team.store.write_session(session)
@@ -686,7 +714,7 @@ def test_team_revise_command_closes_required_gap(tmp_path, capsys) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
     gap_id = session.gaps[0].id
 
     original = cli.argparse.ArgumentParser.parse_args
@@ -789,7 +817,7 @@ def test_team_summary_command_reports_primary_next_step(tmp_path, capsys) -> Non
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -829,7 +857,7 @@ def test_team_summary_command_prioritizes_failed_claude_job(tmp_path, capsys) ->
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -870,7 +898,7 @@ def test_team_summary_command_reports_execute_for_approved_session(tmp_path, cap
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -904,7 +932,7 @@ def test_team_summary_command_reports_human_decision_for_awaiting_human_session(
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Architecture direction change for stage transition")
+    session = _cli_session(team, "Architecture direction change for stage transition")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -938,7 +966,7 @@ def test_team_next_command_reports_revise_command(tmp_path, capsys) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -973,7 +1001,7 @@ def test_team_next_command_reports_execute_command(tmp_path, capsys) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -1011,7 +1039,7 @@ def test_team_next_command_reports_failed_job_inspection_first(tmp_path, capsys)
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1054,7 +1082,7 @@ def test_team_summary_command_reports_recovery_actions_for_failed_claude_job(tmp
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1106,7 +1134,7 @@ def test_team_summary_command_reports_fallback_recovery_provider_policy(tmp_path
         available=False,
         detail=f"{provider} unavailable",
     ) if provider == "claude" else ProviderStatus(provider=provider, available=True, detail="ok")
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1150,7 +1178,7 @@ def test_team_retry_review_command_round_trips_session(tmp_path, capsys) -> None
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1194,7 +1222,7 @@ def test_team_next_command_reports_retry_review_command_for_failed_claude_job(tm
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1237,7 +1265,7 @@ def test_team_resume_command_can_apply_execution_reentry(tmp_path, capsys) -> No
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -1276,7 +1304,7 @@ def test_team_resume_command_can_apply_approval_reentry(tmp_path, capsys) -> Non
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
     revised = team.revise(session.id, summary="Closed adversarial gap", closed_gap_ids=[session.gaps[0].id])
 
     original_build_team = cli._build_team_orchestrator
@@ -1316,7 +1344,7 @@ def test_team_resume_command_rejects_apply_for_revision_state(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -1353,7 +1381,7 @@ def test_team_resume_command_rejects_apply_for_completed_execution_state(tmp_pat
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     original_build_team = cli._build_team_orchestrator
@@ -1391,7 +1419,7 @@ def test_team_resume_command_reconciles_completed_linked_run_from_executing_sess
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
     executed.status = "executing"
     executed.gate_verdict = "approved"
@@ -1436,7 +1464,7 @@ def test_team_next_command_reports_runbook_for_revision_session(tmp_path, capsys
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -1476,7 +1504,7 @@ def test_team_retry_adversarial_review_command_round_trips_session(tmp_path, cap
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     adversarial_round = session.review_rounds[2]
     job_id = adversarial_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(job_id, summary="adversarial failed", error="claude auth failed")
@@ -1519,7 +1547,7 @@ def test_team_next_command_reports_retry_adversarial_review_command_for_failed_c
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     adversarial_round = session.review_rounds[2]
     job_id = adversarial_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(job_id, summary="adversarial failed", error="claude auth failed")
@@ -1559,7 +1587,7 @@ def test_team_runbook_command_reports_revision_workflow(tmp_path, capsys) -> Non
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _cli_session(team, "Build plan with adversarial challenge")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -1599,7 +1627,7 @@ def test_team_runbook_command_reports_approval_when_required_gaps_closed(tmp_pat
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with followup checklist and recovery guidance")
+    session = _cli_session(team, "Build plan with followup checklist and recovery guidance")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:
@@ -1635,7 +1663,7 @@ def test_team_next_command_reports_execution_inspection_after_completion(tmp_pat
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     original_build_team = cli._build_team_orchestrator
@@ -1674,7 +1702,7 @@ def test_team_inspect_execution_command_reports_linked_run_payload(tmp_path, cap
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     original_build_team = cli._build_team_orchestrator
@@ -1718,7 +1746,7 @@ def test_team_inspect_execution_command_rejects_session_without_linked_run(tmp_p
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -1754,7 +1782,7 @@ def test_team_runbook_command_reports_execution_followup_after_completion(tmp_pa
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.approve(team.start("Build plan with followup checklist").id)
+    session = team.approve(_cli_session(team, "Build plan with followup checklist").id)
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     original_build_team = cli._build_team_orchestrator
@@ -1794,7 +1822,7 @@ def test_team_runbook_command_reports_execution_blocked_recovery(tmp_path, capsy
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1847,7 +1875,7 @@ def test_team_runbook_command_reports_execution_provenance_mismatch_recovery(tmp
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1901,7 +1929,7 @@ def test_team_runbook_command_reports_failed_delegation_recovery(tmp_path, capsy
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1945,7 +1973,7 @@ def test_team_summary_command_reports_compliance_blocking(tmp_path, capsys) -> N
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -1984,7 +2012,7 @@ def test_team_runbook_command_reports_compliance_recovery(tmp_path, capsys) -> N
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -2024,7 +2052,7 @@ def test_team_next_command_reports_compliance_check_for_blocking_session(tmp_pat
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original_parse_args = cli.argparse.ArgumentParser.parse_args
@@ -2074,7 +2102,7 @@ def test_team_runbook_command_reports_warning_only_compliance_guidance(tmp_path,
         project_root=tmp_path,
     )
     team.refresh_documentation_sync()
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     session.compliance = team.check_compliance(changed_files=["src/agent_orchestrator/stub.py"])
 
     cli._print_team_runbook(session)
@@ -2101,7 +2129,7 @@ def test_team_summary_command_preserves_warning_only_compliance_guidance(tmp_pat
         project_root=tmp_path,
     )
     team.refresh_documentation_sync()
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     session.compliance = team.check_session_compliance(session.id, changed_files=["src/agent_orchestrator/stub.py"])
     team.store.write_session(session)
 
@@ -2140,7 +2168,7 @@ def test_team_inspect_blockers_command_prints_execution_blocker_summary(tmp_path
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -2200,7 +2228,7 @@ def test_team_inspect_blockers_command_prints_delegated_job_summary(tmp_path, ca
         project_root=tmp_path,
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -2410,7 +2438,7 @@ def test_team_summary_json_format_outputs_session_payload(tmp_path, capsys) -> N
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _cli_session(team, "Build a persisted plan artifact")
 
     original_build_team = cli._build_team_orchestrator
     original = cli.argparse.ArgumentParser.parse_args
@@ -2443,7 +2471,7 @@ def test_team_execute_command_rejects_unapproved_session(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    blocked = team.start("Auth migration with roadmap drift")
+    blocked = _cli_session(team, "Auth migration with roadmap drift")
 
     original = cli.argparse.ArgumentParser.parse_args
     try:

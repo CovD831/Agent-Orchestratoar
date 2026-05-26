@@ -105,6 +105,16 @@ In practice, a user gives the CLI a task plus optional strategy constraints, and
 
 The v1 product is not a bridge product, a tmux/session manager, or a provider-specific orchestration shell. Those concerns remain plugin boundaries around the two core layers.
 
+## Provider Runtime Modes
+
+Provider / Runtime behavior is explicit and auditable:
+
+- `cli_inherit` is the default for implementation and rescue work. It uses the local `codex` / `claude` CLI, including user auth, global config, project config, and provider-native rules.
+- `cli_isolated` runs CLI jobs with a repository-owned runtime home under `.agent_orchestrator/runtime-homes/`, so global rule inheritance is bounded and visible in job metadata.
+- `direct_api` is for low-side-effect governance roles such as planning, review, adversarial review, and summarization. It reads `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` from the environment, reports only masked readiness, and does not provide a local file-editing tool loop.
+
+`team setup` and `health --refresh` report CLI availability, runtime modes, masked direct API readiness, and provider fallback details without storing API keys.
+
 ## Modes
 
 - `success_first`: strongest policy profile with required review and conservative rescue/escalation behavior.

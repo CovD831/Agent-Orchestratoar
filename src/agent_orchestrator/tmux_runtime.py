@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from agent_orchestrator.jobs import AgentJob, FileJobRuntime, JobRequest, JobResult, TERMINAL_STATUSES, _with_operation, now_iso
+from agent_orchestrator.guards import validate_runtime_start
 
 
 class TmuxRunner(Protocol):
@@ -60,6 +61,7 @@ class TmuxJobRuntime(FileJobRuntime):
     runner: TmuxRunner = field(default_factory=SubprocessTmuxRunner)
 
     def start(self, request: JobRequest) -> AgentJob:
+        validate_runtime_start(request)
         job = FileJobRuntime.start(self, request)
         session_name = _session_name(job.id)
         terminal_ref = f"tmux:{session_name}"

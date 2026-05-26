@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_orchestrator import OrchestrationMode, Orchestrator
+from agent_orchestrator.agent_config import AgentConfig, AgentProfile
 from agent_orchestrator.command import ClaudeCodeAdapter, CodexCliAdapter, CommandJobRuntime, CommandResult, ProviderStatus
 from agent_orchestrator.jobs import FileJobRuntime, JobRequest
 from agent_orchestrator.planning import (
@@ -27,6 +28,31 @@ from agent_orchestrator.review import Finding
 from test_support import write_minimal_process_docs
 
 
+def _legacy_started_session(team: TeamOrchestrator, requirement: str, **start_kwargs):
+    session = team.start(requirement, **start_kwargs)
+    session = team.mark_draft_ready(session.id)
+    session = team.submit_draft_for_review(session.id)
+    lowered = requirement.lower()
+    if "architecture direction" in lowered:
+        session.status = "awaiting_human"
+        session.resume.current_phase = "awaiting_human"
+        session.resume.pending_role = "human"
+        team.store.write_session(session)
+    elif "auth migration" in lowered and "roadmap drift" in lowered:
+        session.status = "blocked"
+        session.resume.current_phase = "blocked"
+        session.resume.pending_role = "human"
+        team.store.write_session(session)
+    elif session.gaps:
+        session.status = "needs_revision"
+        session.resume.current_phase = "in_review"
+        session.resume.pending_role = "lead"
+        team.store.write_session(session)
+    elif session.status == "awaiting_human_confirmation":
+        session = team.approve(session.id)
+    return session
+
+
 def test_team_start_persists_session_artifacts(tmp_path) -> None:
     team = TeamOrchestrator(
         orchestrator=Orchestrator(),
@@ -36,18 +62,14 @@ def test_team_start_persists_session_artifacts(tmp_path) -> None:
     session = team.start("Build a persisted plan artifact")
 
     assert session.id
-    assert session.status == "approved_for_execution"
+    assert session.status == "intake_chat"
     assert (tmp_path / session.id / "session.json").exists()
     assert (tmp_path / session.id / "checklist.json").exists()
     assert (tmp_path / session.id / "verdict.json").exists()
     assert (tmp_path / session.id / "work_graph.json").exists()
     rounds_dir = tmp_path / session.id / "rounds"
     assert rounds_dir.exists()
-    assert sorted(path.name for path in rounds_dir.iterdir()) == [
-        "round-001.json",
-        "round-002.json",
-        "round-003.json",
-    ]
+    assert sorted(path.name for path in rounds_dir.iterdir()) == ["round-001.json"]
     payload = json.loads((tmp_path / session.id / "session.json").read_text(encoding="utf-8"))
     assert payload["structured_brief"]["goal"]
     assert payload["structured_brief"]["subtasks"]
@@ -57,12 +79,107 @@ def test_team_start_persists_session_artifacts(tmp_path) -> None:
     assert payload["decision_verdict"]["selected_provider_runtime"]
 
 
+def test_team_start_enters_intake_chat_before_review(tmp_path) -> None:
+    team = TeamOrchestrator(
+        orchestrator=Orchestrator(),
+        store=PlanStore(root=tmp_path / "plans"),
+        runtime=FileJobRuntime(root=tmp_path / "jobs"),
+    )
+
+    session = team.start("Build a conversational planning flow")
+
+    assert session.status == "intake_chat"
+    assert session.resume.current_phase == "intake_chat"
+    assert [round_.round_type for round_ in session.review_rounds] == ["authoring"]
+    assert [job.kind for job in team.runtime.list_recent()] == ["research"]
+    assert session.to_dict()["status_summary"]["next_executable_checklist_item"]["label"] == "Draft confirmed by human"
+    assert session.checklist[2].depends_on == ["Draft confirmed by human"]
+
+
+def test_team_review_waits_for_human_confirmation_before_approval(tmp_path) -> None:
+    team = TeamOrchestrator(
+        orchestrator=Orchestrator(),
+        store=PlanStore(root=tmp_path / "plans"),
+        runtime=FileJobRuntime(root=tmp_path / "jobs"),
+        project_root=tmp_path,
+    )
+    session = team.start("Build a conversational planning flow")
+    session = team.chat_with_lead(session.id, message="Keep the first version readable.")
+    session = team.mark_draft_ready(session.id)
+
+    reviewed = team.submit_draft_for_review(session.id)
+
+    assert reviewed.status == "awaiting_human_confirmation"
+    assert reviewed.resume.current_phase == "awaiting_human_confirmation"
+    assert reviewed.approved_plan is None
+    assert [round_.round_type for round_ in reviewed.review_rounds] == [
+        "authoring",
+        "lead_response",
+        "review",
+        "adversarial_review",
+    ]
+    assert reviewed.to_dict()["status_summary"]["primary_action"] == "approve"
+
+
+def test_team_start_uses_distinct_configured_review_agents(tmp_path) -> None:
+    runtime = FileJobRuntime(root=tmp_path / "jobs")
+    config = AgentConfig(
+        profiles={
+            **AgentConfig.defaults().profiles,
+            "planner": AgentProfile(
+                role="planner",
+                provider="claude",
+                model="sonnet",
+                prompt_template="Planner custom: {default_prompt}",
+            ),
+            "plan_reviewer": AgentProfile(
+                role="plan_reviewer",
+                provider="codex",
+                model="gpt-review",
+                prompt_template="Reviewer custom: {default_prompt}",
+            ),
+            "adversarial_reviewer": AgentProfile(
+                role="adversarial_reviewer",
+                provider="claude",
+                model="opus",
+                prompt_template="Adversarial custom: {default_prompt}",
+            ),
+        }
+    )
+    team = TeamOrchestrator(
+        orchestrator=Orchestrator(),
+        store=PlanStore(root=tmp_path / "plans"),
+        runtime=runtime,
+        agent_config=config,
+    )
+
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
+    session = team.mark_draft_ready(session.id)
+    session = team.submit_draft_for_review(session.id)
+    jobs = {job.kind: job for job in runtime.list_recent()}
+
+    assert jobs["research"].provider == "claude"
+    assert jobs["research"].model == "sonnet"
+    assert jobs["research"].prompt.startswith("Planner custom:")
+    assert jobs["review"].provider == "codex"
+    assert jobs["review"].model == "gpt-review"
+    assert jobs["review"].prompt.startswith("Reviewer custom:")
+    assert jobs["adversarial_review"].provider == "claude"
+    assert jobs["adversarial_review"].model == "opus"
+    assert jobs["adversarial_review"].prompt.startswith("Adversarial custom:")
+    selected = session.decision_verdict.selected_provider_runtime
+    assert selected["reviewer"] == "codex"
+    assert selected["adversarial_reviewer"] == "claude"
+    assert selected["reviewer_model"] == "gpt-review"
+    assert selected["adversarial_reviewer_model"] == "opus"
+
+
 def test_team_resume_round_trips_persisted_session(tmp_path) -> None:
     team = TeamOrchestrator(
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path),
     )
-    created = team.start("Build a persisted plan artifact")
+    created = _legacy_started_session(team, "Build a persisted plan artifact")
 
     resumed = team.resume(created.id)
 
@@ -70,7 +187,7 @@ def test_team_resume_round_trips_persisted_session(tmp_path) -> None:
     assert resumed.status == created.status
     assert resumed.resume.current_phase == created.resume.current_phase
     assert resumed.structured_brief == created.structured_brief
-    assert resumed.to_dict()["status_summary"]["resume_action"] == "execute"
+    assert resumed.to_dict()["status_summary"]["resume_action"] == "mark_draft_ready"
 
 
 def test_team_resume_normalizes_review_retry_guidance(tmp_path) -> None:
@@ -80,7 +197,7 @@ def test_team_resume_normalizes_review_retry_guidance(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -102,7 +219,7 @@ def test_team_resume_normalizes_adversarial_retry_guidance(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     adversarial_round = session.review_rounds[2]
     adversarial_job_id = adversarial_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(adversarial_job_id, summary="adversarial failed", error="claude auth failed")
@@ -121,7 +238,7 @@ def test_team_resume_marks_revision_reentry_point(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
     session.resume.current_phase = "drafting"
     session.resume.pending_role = "build"
     team.store.write_session(session)
@@ -138,7 +255,7 @@ def test_team_resume_can_apply_execute_reentry_for_approved_session(tmp_path) ->
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     resumed = team.resume(session.id, apply=True)
 
@@ -154,7 +271,7 @@ def test_team_resume_can_apply_retry_review_for_failed_claude_job(tmp_path) -> N
         store=PlanStore(root=tmp_path / "plans"),
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     failed_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(failed_job_id, summary="review failed", error="claude auth failed")
@@ -175,7 +292,7 @@ def test_team_resume_can_apply_approval_when_required_gaps_are_closed(tmp_path) 
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
     revised = team.revise(session.id, summary="Closed adversarial gap", closed_gap_ids=[session.gaps[0].id])
 
     resumed = team.resume(revised.id, apply=True)
@@ -190,7 +307,7 @@ def test_team_resume_apply_rejects_revision_state_even_when_next_step_is_known(t
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     with pytest.raises(ValueError, match="cannot auto-apply resume action 'revise'"):
         team.resume(session.id, apply=True)
@@ -202,7 +319,7 @@ def test_team_resume_apply_rejects_completed_execution_inspection_state(tmp_path
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     with pytest.raises(ValueError, match="cannot auto-apply resume action 'inspect_execution'"):
@@ -216,7 +333,7 @@ def test_team_resume_apply_rejects_compliance_blocked_state(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     resumed = team.resume(session.id, apply=True)
     assert resumed.status == "accepted"
@@ -227,7 +344,7 @@ def test_team_resume_apply_rejects_awaiting_human_state(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Architecture direction change for stage transition")
+    session = _legacy_started_session(team, "Architecture direction change for stage transition")
 
     with pytest.raises(ValueError, match="cannot auto-apply resume action 'human_decision'"):
         team.resume(session.id, apply=True)
@@ -239,7 +356,7 @@ def test_team_resume_apply_rejects_executing_state(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     session.status = "executing"
     session.gate_verdict = "approved"
     session.resume.current_phase = "approved"
@@ -259,7 +376,7 @@ def test_team_resume_apply_keeps_baseline_warning_session_auto_executable(tmp_pa
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     resumed = team.resume(session.id, apply=True)
 
@@ -272,7 +389,7 @@ def test_team_execute_requires_approved_plan(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path),
     )
-    session = team.start("Auth migration with roadmap drift")
+    session = _legacy_started_session(team, "Auth migration with roadmap drift")
 
     assert session.status == "blocked"
     with pytest.raises(ValueError, match="approved plan"):
@@ -285,7 +402,7 @@ def test_team_execute_links_execution_run(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
@@ -301,7 +418,7 @@ def test_team_execute_rejects_when_approved_plan_missing(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     session.approved_plan = None
     session.status = "approved_for_execution"
     session.gate_verdict = "approved"
@@ -323,7 +440,7 @@ def test_team_approve_can_promote_low_severity_review(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path),
     )
-    session = team.start("Build plan with followup checklist")
+    session = _legacy_started_session(team, "Build plan with followup checklist")
 
     assert session.status == "needs_revision"
     approved = team.approve(session.id)
@@ -337,7 +454,7 @@ def test_team_approve_rejects_blocked_plan(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path),
     )
-    session = team.start("Auth migration with roadmap drift")
+    session = _legacy_started_session(team, "Auth migration with roadmap drift")
 
     with pytest.raises(ValueError, match="needs_revision"):
         team.approve(session.id)
@@ -348,7 +465,7 @@ def test_team_approve_rejects_already_approved_plan(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     with pytest.raises(ValueError, match="already approved"):
         team.approve(session.id)
@@ -360,7 +477,7 @@ def test_team_high_severity_review_blocks_acceptance(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Auth migration with roadmap drift")
+    session = _legacy_started_session(team, "Auth migration with roadmap drift")
 
     assert session.status == "blocked"
     severities = [
@@ -378,7 +495,7 @@ def test_team_execute_with_medium_findings_returns_needs_followup(tmp_path) -> N
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.approve(team.start("Build plan with followup checklist").id)
+    session = team.approve(_legacy_started_session(team, "Build plan with followup checklist").id)
 
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
@@ -393,7 +510,7 @@ def test_team_execute_rejects_when_execution_checklist_is_incomplete(tmp_path) -
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.approve(team.start("Build plan with followup checklist").id)
+    session = team.approve(_legacy_started_session(team, "Build plan with followup checklist").id)
     session.checklist[2].completed = False
     team.store.write_session(session)
 
@@ -407,7 +524,7 @@ def test_team_escalation_marks_session_awaiting_human(tmp_path) -> None:
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Architecture direction change for stage transition")
+    session = _legacy_started_session(team, "Architecture direction change for stage transition")
 
     assert session.status == "awaiting_human"
     assert session.resume.pending_role == "lead"
@@ -644,7 +761,7 @@ def test_team_check_compliance_blocks_on_root_map_structure_drift(tmp_path) -> N
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.compliance is not None
     assert session.compliance["blocking"] is False
@@ -663,7 +780,7 @@ def test_team_check_compliance_blocks_on_root_map_entry_drift(tmp_path) -> None:
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.compliance is not None
     assert session.compliance["blocking"] is False
@@ -682,7 +799,7 @@ def test_team_check_compliance_blocks_on_source_file_header_drift(tmp_path) -> N
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.compliance is not None
     assert session.compliance["blocking"] is True
@@ -761,7 +878,7 @@ def test_team_status_surfaces_warning_only_compliance_guidance(tmp_path) -> None
     )
     team.refresh_documentation_sync()
     compliance = team.check_compliance(changed_files=["src/agent_orchestrator/stub.py"])
-    warning_session = team.start("Build a persisted plan artifact")
+    warning_session = _legacy_started_session(team, "Build a persisted plan artifact")
     warning_session.compliance = compliance
 
     status = warning_session.to_dict()["status_summary"]
@@ -870,7 +987,7 @@ def test_team_check_compliance_blocks_on_module_manifest_coverage_drift(tmp_path
         encoding="utf-8",
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.compliance is not None
     assert session.compliance["blocking"] is False
@@ -934,7 +1051,7 @@ def test_team_check_compliance_returns_structured_contract_for_project_and_sessi
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     project_compliance = team.check_compliance(changed_files=["src/agent_orchestrator/stub.py"])
     session_compliance = team.check_session_compliance(session.id, changed_files=["src/agent_orchestrator/stub.py"])
@@ -964,7 +1081,7 @@ def test_team_status_preserves_warning_only_compliance_snapshot(tmp_path) -> Non
         project_root=tmp_path,
     )
     team.refresh_documentation_sync()
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     session.compliance = team.check_session_compliance(session.id, changed_files=["src/agent_orchestrator/stub.py"])
     team.store.write_session(session)
 
@@ -995,7 +1112,7 @@ def test_team_revision_round_opens_and_closes_gaps_before_approval(tmp_path) -> 
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     assert session.status == "needs_revision"
     assert session.gaps
@@ -1019,7 +1136,7 @@ def test_team_revise_refreshes_doc_sync_snapshot(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
     (tmp_path / "docs" / "process" / "module-manifest.md").write_text("# Module Manifest\n", encoding="utf-8")
 
     revised = team.revise(session.id, summary="Closed adversarial gap", closed_gap_ids=[session.gaps[0].id])
@@ -1036,7 +1153,7 @@ def test_team_retry_review_refreshes_doc_sync_snapshot(tmp_path) -> None:
         runtime=runtime,
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     failed_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(failed_job_id, summary="review failed", error="claude auth failed")
@@ -1052,7 +1169,7 @@ def test_team_approve_rejects_when_required_gaps_remain_open(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     with pytest.raises(ValueError, match="open gaps"):
         team.approve(session.id)
@@ -1063,7 +1180,7 @@ def test_team_revise_rejects_unknown_gap_ids(tmp_path) -> None:
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     with pytest.raises(ValueError, match="unknown gap"):
         team.revise(session.id, summary="Attempted to close a nonexistent gap", closed_gap_ids=["gap-missing"])
@@ -1075,7 +1192,7 @@ def test_team_execute_persists_approved_plan_handoff_metadata(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
     run_payload = json.loads((tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json").read_text(encoding="utf-8"))
@@ -1103,7 +1220,7 @@ def test_team_inspect_execution_reads_linked_run_payload(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
     payload = team.inspect_execution(executed.id)
@@ -1122,7 +1239,7 @@ def test_team_inspect_execution_rejects_session_without_linked_run(tmp_path) -> 
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     with pytest.raises(ValueError, match="linked execution run"):
         team.inspect_execution(session.id)
@@ -1158,7 +1275,7 @@ def test_team_start_with_command_runtime_uses_claude_review_jobs(tmp_path) -> No
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     review_round = session.review_rounds[1]
     adversarial_round = session.review_rounds[2]
@@ -1186,7 +1303,7 @@ def test_team_start_records_provider_fallback_when_reviewer_is_unavailable(tmp_p
         detail=f"{provider} unavailable",
     ) if provider == "claude" else ProviderStatus(provider=provider, available=True, detail="ok")
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["selected_provider_runtime"]["reviewer"] == "codex"
@@ -1214,7 +1331,7 @@ def test_team_start_records_author_fallback_when_codex_is_unavailable(tmp_path) 
         detail=f"{provider} unavailable",
     ) if provider == "codex" else ProviderStatus(provider=provider, available=True, detail="ok")
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["selected_provider_runtime"]["author"] == "claude"
@@ -1233,7 +1350,7 @@ def test_team_start_uses_provider_backed_round_jobs(tmp_path) -> None:
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     lead_round = session.review_rounds[0]
     review_round = session.review_rounds[1]
@@ -1253,7 +1370,7 @@ def test_team_start_adds_adversarial_review_round(tmp_path) -> None:
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert [round_.round_type for round_ in session.review_rounds] == [
         "authoring",
@@ -1269,7 +1386,7 @@ def test_team_start_builds_decision_verdict_with_fixed_dual_model_roles(tmp_path
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["approval_status"] == "approved"
@@ -1277,6 +1394,9 @@ def test_team_start_builds_decision_verdict_with_fixed_dual_model_roles(tmp_path
     assert session.decision_verdict["selected_provider_runtime"]["author"] == "codex"
     assert session.decision_verdict["selected_provider_runtime"]["reviewer"] == "claude"
     assert session.decision_verdict["selected_provider_runtime"]["runtime"] == "mock"
+    assert session.decision_verdict["selected_provider_runtime"]["author_runtime_mode"] == "cli_inherit"
+    assert session.decision_verdict["selected_provider_runtime"]["reviewer_runtime_mode"] == "direct_api"
+    assert session.decision_verdict["selected_provider_runtime"]["direct_api_scope"]
 
 
 def test_team_start_distinguishes_required_and_followup_gaps_in_decision_verdict(tmp_path) -> None:
@@ -1285,8 +1405,8 @@ def test_team_start_distinguishes_required_and_followup_gaps_in_decision_verdict
         store=PlanStore(root=tmp_path),
     )
 
-    followup_session = team.start("Build plan with followup checklist")
-    required_session = team.start("Build plan with adversarial challenge")
+    followup_session = _legacy_started_session(team, "Build plan with followup checklist")
+    required_session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     assert followup_session.decision_verdict is not None
     assert followup_session.decision_verdict["required_gaps"] == []
@@ -1301,7 +1421,7 @@ def test_team_execute_uses_approved_plan_contract_instead_of_raw_requirement(tmp
         store=PlanStore(root=tmp_path / "plans"),
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     session.approved_plan["goal"] = "Approved plan goal takes precedence"
     team.store.write_session(session)
 
@@ -1318,7 +1438,7 @@ def test_team_approved_plan_exposes_shared_execution_contract_schema(tmp_path) -
         store=PlanStore(root=tmp_path / "plans"),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.approved_plan is not None
     assert session.approved_plan["execution_contract"]["source"] == "approved_plan_session"
@@ -1337,7 +1457,7 @@ def test_team_start_records_explicit_topology_selection_reasoning(tmp_path) -> N
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Implement a tiny direct change")
+    session = _legacy_started_session(team, "Implement a tiny direct change")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["selected_topology"] in {
@@ -1358,7 +1478,7 @@ def test_team_start_uses_team_topology_for_parallel_low_risk_work(tmp_path) -> N
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Implement multiple independent modules in parallel")
+    session = _legacy_started_session(team, "Implement multiple independent modules in parallel")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["selected_topology"] == "team"
@@ -1374,7 +1494,7 @@ def test_team_start_uses_adversarial_topology_for_high_risk_work(tmp_path) -> No
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Implement auth migration across multiple services")
+    session = _legacy_started_session(team, "Implement auth migration across multiple services")
 
     assert session.decision_verdict is not None
     assert session.decision_verdict["selected_topology"] == "team_with_adversarial_review"
@@ -1391,7 +1511,7 @@ def test_team_start_records_review_policy_override_and_provider_health_snapshot(
     )
     health_snapshot = {"providers": [{"provider": "claude", "available": False, "recommended_fallback": "codex"}]}
 
-    session = team.start(
+    session = _legacy_started_session(team, 
         "Build a persisted plan artifact",
         review_policy_override="adversarial",
         provider_health_snapshot=health_snapshot,
@@ -1409,7 +1529,7 @@ def test_adversarial_review_can_force_needs_revision(tmp_path) -> None:
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
 
     assert session.status == "needs_revision"
     assert session.gate_verdict == "needs_revision"
@@ -1423,7 +1543,7 @@ def test_team_start_builds_structured_brief_from_contract_and_subtasks(tmp_path)
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.structured_brief.goal
     assert session.structured_brief.constraints == []
@@ -1442,7 +1562,7 @@ def test_team_start_assigns_checklist_item_owners(tmp_path) -> None:
         store=PlanStore(root=tmp_path),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert [(item.label, item.owner) for item in session.checklist] == [
         ("Lead brief persisted", "lead"),
@@ -1457,7 +1577,7 @@ def test_team_status_reports_operator_guidance_for_revision(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
 
-    session = team.start("Build plan with adversarial challenge")
+    session = _legacy_started_session(team, "Build plan with adversarial challenge")
     status = team.status(session.id)
 
     assert status.to_dict()["status_summary"]["next_actions"] == ["revise"]
@@ -1473,7 +1593,7 @@ def test_team_status_reports_failed_delegated_job_and_next_step(tmp_path) -> Non
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1494,7 +1614,7 @@ def test_team_status_reports_in_progress_delegated_review_job(tmp_path) -> None:
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     running_job = runtime.start(
         JobRequest(
             task_id=session.id,
@@ -1530,7 +1650,7 @@ def test_team_status_reports_claude_specific_inspect_guidance_on_failed_job(tmp_
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -1556,7 +1676,7 @@ def test_team_status_reports_generic_recovery_actions_for_non_claude_failure(tmp
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     job = runtime.status(review_job_id)
@@ -1591,7 +1711,7 @@ def test_team_status_reports_fallback_recovery_provider_when_claude_is_unavailab
         detail=f"{provider} unavailable",
     ) if provider == "claude" else ProviderStatus(provider=provider, available=True, detail="ok")
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     failed_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(failed_job_id, summary="review failed", error="claude auth failed")
@@ -1616,7 +1736,7 @@ def test_team_retry_review_replaces_failed_review_job_and_restores_guidance(tmp_
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     failed_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(failed_job_id, summary="review failed", error="claude auth failed")
@@ -1642,7 +1762,7 @@ def test_team_retry_adversarial_review_replaces_failed_job_and_restores_guidance
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     adversarial_round = session.review_rounds[2]
     failed_job_id = adversarial_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(failed_job_id, summary="adversarial failed", error="claude auth failed")
@@ -1667,7 +1787,7 @@ def test_team_retry_review_uses_recommended_fallback_provider_consistently(tmp_p
         runtime=runtime,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     session.structured_brief.provider_recommendation.update(
         {
             "reviewer": "mock",
@@ -1703,7 +1823,7 @@ def test_team_status_reports_execute_readiness_for_approved_session(tmp_path) ->
         store=PlanStore(root=tmp_path / "plans"),
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     status = team.status(session.id).to_dict()["status_summary"]
 
     assert status["next_actions"] == ["execute"]
@@ -1717,7 +1837,7 @@ def test_team_status_reports_human_decision_requirement(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
     )
 
-    session = team.start("Architecture direction change for stage transition")
+    session = _legacy_started_session(team, "Architecture direction change for stage transition")
     status = team.status(session.id).to_dict()["status_summary"]
 
     assert status["next_actions"] == ["human_decision"]
@@ -1737,7 +1857,7 @@ def test_team_start_records_doc_sync_and_compliance_snapshot(tmp_path) -> None:
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.doc_sync is not None
     assert session.doc_sync["project_root"] == str(tmp_path)
@@ -1754,7 +1874,7 @@ def test_team_execute_rejects_when_compliance_blocking_is_active(tmp_path) -> No
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     assert session.compliance is not None
     assert session.compliance["blocking"] is False
@@ -1770,7 +1890,7 @@ def test_team_status_reports_compliance_blocking_guidance(tmp_path) -> None:
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     status = team.status(session.id).to_dict()["status_summary"]
 
     assert status["next_actions"][0] == "execute"
@@ -1788,7 +1908,7 @@ def test_team_status_reports_content_sync_blocking_for_missing_runbook_link(tmp_
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     status = team.status(session.id).to_dict()["status_summary"]
 
     assert status["next_actions"][0] == "execute"
@@ -1807,7 +1927,7 @@ def test_team_status_reports_content_sync_blocking_for_stale_operator_runbook_si
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     status = team.status(session.id).to_dict()["status_summary"]
 
     assert status["next_actions"][0] == "execute"
@@ -1827,7 +1947,7 @@ def test_team_status_reports_provenance_sync_blocking_after_execution(tmp_path) 
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1849,7 +1969,7 @@ def test_team_resume_reconciles_executing_session_when_linked_run_completed(tmp_
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     executed.status = "executing"
@@ -1874,7 +1994,7 @@ def test_team_resume_reconciles_executing_session_when_linked_run_blocked(tmp_pa
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1906,7 +2026,7 @@ def test_team_status_reports_execution_block_source_after_linked_run_failure(tmp
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1939,7 +2059,7 @@ def test_team_status_reports_execution_provenance_mismatch_block_detail(tmp_path
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -1970,7 +2090,7 @@ def test_team_inspect_execution_reports_provenance_mismatch_summary(tmp_path) ->
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -2006,7 +2126,7 @@ def test_team_inspect_execution_surfaces_warning_only_compliance_context(tmp_pat
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
     team.refresh_documentation_sync()
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
     executed.compliance = team.check_session_compliance(executed.id, changed_files=["src/agent_orchestrator/stub.py"])
     team.store.write_session(executed)
@@ -2025,7 +2145,7 @@ def test_team_inspect_blockers_summarizes_execution_blocked_session(tmp_path) ->
         project_root=tmp_path,
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     executed = team.execute(session.id, OrchestrationMode.SUCCESS_FIRST)
 
     run_path = tmp_path / "runs" / f"{executed.resume.linked_execution_run_id}.json"
@@ -2059,7 +2179,7 @@ def test_team_inspect_blockers_summarizes_failed_delegated_review(tmp_path) -> N
         project_root=tmp_path,
         runtime=runtime,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
     review_round = session.review_rounds[1]
     review_job_id = review_round.summary.split("job ")[-1].rstrip(".")
     runtime.fail(review_job_id, summary="review failed", error="claude auth failed")
@@ -2080,7 +2200,7 @@ def test_team_inspect_blockers_summarizes_compliance_blocker(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     inspected = team.inspect_blockers(session.id)
 
@@ -2097,7 +2217,7 @@ def test_team_status_reports_plan_artifact_blocking_when_checklist_snapshot_is_m
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     checklist_path = tmp_path / "plans" / session.id / "checklist.json"
     checklist_path.unlink()
@@ -2115,7 +2235,7 @@ def test_team_status_reports_plan_artifact_blocking_when_round_snapshots_are_inc
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = _legacy_started_session(team, "Build a persisted plan artifact")
 
     round_path = tmp_path / "plans" / session.id / "rounds" / "round-003.json"
     round_path.unlink()

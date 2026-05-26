@@ -84,11 +84,82 @@ def test_memory_search_endpoint_returns_records(tmp_path) -> None:
     assert response.json()["records"]
 
 
+def test_agent_config_endpoint_round_trips_profiles(tmp_path) -> None:
+    client, _service = _client(tmp_path)
+
+    payload = client.get("/api/agent-config").json()
+    payload["profiles"]["worker"]["provider"] = "claude"
+    payload["profiles"]["worker"]["model"] = "opus"
+    payload["profiles"]["worker"]["prompt_template"] = "Worker UI: {default_prompt}"
+
+    response = client.post("/api/agent-config", json=payload)
+
+    assert response.status_code == 200
+    saved = client.get("/api/agent-config").json()
+    assert saved["profiles"]["worker"]["provider"] == "claude"
+    assert saved["profiles"]["worker"]["model"] == "opus"
+    assert saved["profiles"]["worker"]["prompt_template"] == "Worker UI: {default_prompt}"
+
+
 def test_index_contains_operator_and_job_control_mounts(tmp_path) -> None:
     client, _service = _client(tmp_path)
 
     response = client.get("/")
 
     assert response.status_code == 200
-    assert 'id="operator-summary"' in response.text
-    assert 'id="job-actions"' in response.text
+    assert (
+        'id="operator-summary"' in response.text
+        or 'id="root"' in response.text
+    )
+    assert (
+        'id="job-actions"' in response.text
+        or 'src="/static/' in response.text
+        or 'src="/src/main.jsx"' in response.text
+    )
+
+
+def test_job_terminal_snapshot_endpoint_returns_snapshot(tmp_path) -> None:
+    runtime = FileJobRuntime(root=tmp_path / "jobs")
+    client, _service = _client(tmp_path, runtime=runtime)
+    job = runtime.start(
+        JobRequest(
+            task_id="ui-terminal-job",
+            provider="codex",
+            kind="implementation",
+            prompt="Build terminal UI",
+            cwd=str(tmp_path),
+            metadata={"terminal_ref": "tmux:agent-ui", "attach_available": True},
+        )
+    )
+    runtime.complete(job.id, summary="done", stdout="pane output")
+
+    response = client.get(f"/api/jobs/{job.id}/terminal/snapshot")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == job.id
+    assert payload["terminal_ref"] == "tmux:agent-ui"
+    assert payload["stdout"] == "pane output"
+
+
+def test_job_terminal_input_and_reconnect_endpoints(tmp_path) -> None:
+    runtime = FileJobRuntime(root=tmp_path / "jobs")
+    client, _service = _client(tmp_path, runtime=runtime)
+    job = runtime.start(
+        JobRequest(
+            task_id="ui-terminal-job-ops",
+            provider="codex",
+            kind="implementation",
+            prompt="Build terminal UI",
+            cwd=str(tmp_path),
+            metadata={"terminal_ref": "tmux:agent-ui", "attach_available": True},
+        )
+    )
+
+    send_response = client.post(f"/api/jobs/{job.id}/terminal/input", json={"message": "continue"})
+    reconnect_response = client.post(f"/api/jobs/{job.id}/terminal/reconnect")
+
+    assert send_response.status_code == 200
+    assert send_response.json()["operation"]["status"] == "accepted"
+    assert reconnect_response.status_code == 200
+    assert reconnect_response.json()["job_id"] == job.id

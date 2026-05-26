@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field, replace
@@ -22,6 +23,7 @@ from agent_orchestrator.jobs import (
     now_iso,
     new_job_id,
 )
+from agent_orchestrator.guards import validate_runtime_start
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,11 @@ class CommandRunner(Protocol):
 
     def spawn(self, command: list[str], *, cwd: str, env: dict[str, str] | None = None) -> ProviderSession:
         """Spawn a background session, when supported."""
+
+
+class DirectApiClient(Protocol):
+    def complete(self, request: JobRequest) -> dict[str, Any]:
+        """Run a single-turn provider API request and return a structured payload."""
 
 
 @dataclass(slots=True)
@@ -347,6 +354,17 @@ class ProviderHealthCheck:
 
 
 @dataclass(slots=True)
+class StaticDirectApiClient:
+    """Fakeable direct API client used until provider SDKs are wired in."""
+
+    def complete(self, request: JobRequest) -> dict[str, Any]:
+        return {
+            "summary": f"Direct API {request.provider} {request.kind} completed.",
+            "usage": {"input_tokens": None, "output_tokens": None, "source": "not_reported"},
+        }
+
+
+@dataclass(slots=True)
 class PromptRenderer:
     def render(self, request: JobRequest) -> str:
         return "\n\n".join(
@@ -360,6 +378,7 @@ class PromptRenderer:
                 (
                     "Safety Boundaries\n"
                     f"Use sandbox={request.resolved_sandbox}. Do not exceed max_depth={request.max_depth}. "
+                    f"Runtime mode is {request.runtime_mode}. "
                     "Do not auto-fix review findings unless this is an explicit rescue or implementation job."
                 ),
                 (
@@ -501,13 +520,20 @@ class CommandJobRuntime(FileJobRuntime):
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def start(self, request: JobRequest) -> AgentJob:
+        validate_runtime_start(request)
         adapter = self.adapters.get(request.provider)
         if not adapter:
             raise ValueError(f"No command adapter configured for provider: {request.provider}")
 
         command_spec = adapter.build_command(request)
+        job_id = new_job_id()
+        runtime_env, runtime_metadata = _runtime_environment(request, self.root, job_id)
+        command_spec = CommandSpec(
+            command=command_spec.command,
+            env=_merge_env(command_spec.env, runtime_env),
+        )
         job = AgentJob(
-            id=new_job_id(),
+            id=job_id,
             task_id=request.task_id,
             provider=request.provider,
             kind=request.kind,
@@ -517,13 +543,14 @@ class CommandJobRuntime(FileJobRuntime):
             cwd=request.cwd,
             sandbox=request.resolved_sandbox,
             reasoning_effort=request.reasoning_effort,
+            runtime_mode=request.runtime_mode,
             model=request.model,
             started_at=now_iso(),
             updated_at=now_iso(),
             summary=f"{request.provider} {request.kind} job started.",
             command=command_spec.command,
             delegation_chain=request.next_delegation_chain,
-            metadata=request.metadata,
+            metadata={**request.metadata, "runtime_mode": runtime_metadata},
         )
         self._write_job(job)
         self._update_index(job.id)
@@ -728,6 +755,7 @@ class CommandJobRuntime(FileJobRuntime):
                         model=job.model,
                         reasoning_effort=job.reasoning_effort,
                         sandbox=job.sandbox,
+                        runtime_mode=job.runtime_mode,
                         metadata=job.metadata,
                     )
                     try:
@@ -817,6 +845,100 @@ class CommandJobRuntime(FileJobRuntime):
             return None
 
 
+@dataclass(slots=True)
+class DirectApiJobRuntime(FileJobRuntime):
+    client: DirectApiClient = field(default_factory=StaticDirectApiClient)
+
+    def start(self, request: JobRequest) -> AgentJob:
+        validate_runtime_start(request)
+        if request.runtime_mode != "direct_api":
+            request = replace(request, runtime_mode="direct_api")
+        job = FileJobRuntime.start(self, request)
+        auth = direct_api_auth_status(request.provider)
+        metadata = {
+            **job.metadata,
+            "runtime_mode": {
+                "mode": "direct_api",
+                "inherits_user_config": False,
+                "config_source": "environment_api_key",
+                "project_cwd": request.cwd,
+                "sandbox": request.resolved_sandbox,
+                "direct_api_tool_loop": False,
+            },
+            "direct_api_auth": auth,
+        }
+        job = replace(job, runtime_mode="direct_api", metadata=metadata)
+        self._write_job(job)
+        if not auth["available"]:
+            return self.fail(
+                job.id,
+                summary=f"{request.provider} direct API authentication is required.",
+                error="auth_required",
+                parsed_payload={
+                    "provider": request.provider,
+                    "kind": request.kind,
+                    "auth": auth,
+                    "runtime_mode": "direct_api",
+                },
+            )
+        payload = self.client.complete(request)
+        summary = str(payload.get("summary") or f"{request.provider} direct API job completed.")
+        parsed_payload = {
+            "provider": request.provider,
+            "model": request.model,
+            "kind": request.kind,
+            "summary": summary,
+            "usage": payload.get("usage", {"input_tokens": None, "output_tokens": None, "source": "not_reported"}),
+            "runtime_mode": "direct_api",
+            "tool_loop": False,
+        }
+        return self.complete(
+            job.id,
+            summary=summary,
+            stdout=summary,
+            raw_output=summary,
+            parsed_payload=parsed_payload,
+            phase="done",
+        )
+
+
+@dataclass(slots=True)
+class RuntimeModeRouter:
+    cli_runtime: CommandJobRuntime = field(default_factory=CommandJobRuntime)
+    direct_api_runtime: DirectApiJobRuntime = field(default_factory=DirectApiJobRuntime)
+    _routes: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+
+    @property
+    def adapters(self) -> dict[Provider, ProviderAdapter]:
+        return self.cli_runtime.adapters
+
+    def start(self, request: JobRequest) -> AgentJob:
+        if request.runtime_mode == "direct_api":
+            job = self.direct_api_runtime.start(request)
+            self._routes[job.id] = "direct_api"
+            return job
+        job = self.cli_runtime.start(request)
+        self._routes[job.id] = "cli"
+        return job
+
+    def status(self, job_id: str) -> AgentJob:
+        return self._runtime(job_id).status(job_id)
+
+    def result(self, job_id: str) -> JobResult:
+        return self._runtime(job_id).result(job_id)
+
+    def send(self, job_id: str, message: str) -> AgentJob:
+        return self._runtime(job_id).send(job_id, message)
+
+    def cancel(self, job_id: str) -> AgentJob:
+        return self._runtime(job_id).cancel(job_id)
+
+    def _runtime(self, job_id: str) -> FileJobRuntime:
+        if self._routes.get(job_id) == "direct_api":
+            return self.direct_api_runtime
+        return self.cli_runtime
+
+
 def _provider_binary(provider: Provider) -> str:
     if provider == "claude":
         return "claude"
@@ -825,12 +947,89 @@ def _provider_binary(provider: Provider) -> str:
     return provider
 
 
+def direct_api_auth_status(provider: Provider) -> dict[str, object]:
+    key_name = "OPENAI_API_KEY" if provider == "codex" else "ANTHROPIC_API_KEY" if provider == "claude" else None
+    if key_name is None:
+        return {
+            "provider": provider,
+            "available": True,
+            "status": "not_required",
+            "key_name": None,
+            "masked": None,
+        }
+    value = os.environ.get(key_name, "")
+    present = bool(value)
+    return {
+        "provider": provider,
+        "available": present,
+        "status": "present" if present else "auth_required",
+        "key_name": key_name,
+        "masked": _mask_secret(value) if present else None,
+    }
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:3]}...{value[-4:]}"
+
+
 def _recommended_provider_fallback(provider: Provider) -> Provider | None:
     if provider == "codex":
         return "claude"
     if provider == "claude":
         return "codex"
     return "mock"
+
+
+def _runtime_mode_metadata(request: JobRequest, jobs_root: Path) -> dict[str, object]:
+    inherited = request.runtime_mode == "cli_inherit"
+    return {
+        "mode": request.runtime_mode,
+        "inherits_user_config": inherited,
+        "config_source": "user_and_project_cli_config" if inherited else request.runtime_mode,
+        "effective_home": os.path.expanduser("~") if inherited else None,
+        "project_cwd": request.cwd,
+        "sandbox": request.resolved_sandbox,
+        "jobs_root": str(jobs_root),
+        "direct_api_tool_loop": False,
+    }
+
+
+def _runtime_environment(request: JobRequest, jobs_root: Path, job_id: str) -> tuple[dict[str, str] | None, dict[str, object]]:
+    if request.runtime_mode != "cli_isolated":
+        return None, _runtime_mode_metadata(request, jobs_root)
+    runtime_home = jobs_root.parent / "runtime-homes" / job_id
+    runtime_home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "HOME": str(runtime_home),
+        "XDG_CONFIG_HOME": str(runtime_home / ".config"),
+        "XDG_CACHE_HOME": str(runtime_home / ".cache"),
+    }
+    metadata = _runtime_mode_metadata(request, jobs_root)
+    metadata.update(
+        {
+            "effective_home": str(runtime_home),
+            "config_source": "isolated_runtime_home",
+            "runtime_home": str(runtime_home),
+            "xdg_config_home": env["XDG_CONFIG_HOME"],
+            "xdg_cache_home": env["XDG_CACHE_HOME"],
+        }
+    )
+    return env, metadata
+
+
+def _merge_env(base: dict[str, str] | None, overlay: dict[str, str] | None) -> dict[str, str] | None:
+    if not base and not overlay:
+        return None
+    merged = dict(os.environ)
+    if base:
+        merged.update(base)
+    if overlay:
+        merged.update(overlay)
+    return merged
 
 
 def _cache_entry_valid(entry: object) -> bool:

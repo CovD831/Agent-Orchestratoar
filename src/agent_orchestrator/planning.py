@@ -14,7 +14,13 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
+from agent_orchestrator.agent_config import AgentConfig, AgentProfile
 from agent_orchestrator.jobs import FileJobRuntime, JobRequest, JobRuntime
+from agent_orchestrator.guards import (
+    validate_artifact_write,
+    validate_execution_gate,
+    validate_role_state_action,
+)
 from agent_orchestrator.command import ProviderHealthCheck, ProviderStatus
 from agent_orchestrator.events import EventStore
 from agent_orchestrator.ideation import run_ideation
@@ -50,6 +56,10 @@ from agent_orchestrator.work_graph import WorkGraphStore, build_initial_work_gra
 TeamRole = Literal["lead", "build", "review"]
 GapStatus = Literal["open", "acknowledged", "closed"]
 PlanSessionStatus = Literal[
+    "intake_chat",
+    "draft_ready",
+    "adversarial_review",
+    "awaiting_human_confirmation",
     "drafting",
     "in_review",
     "needs_revision",
@@ -64,6 +74,7 @@ GateVerdict = Literal["approved", "needs_revision", "blocked", "accepted", "need
 ApprovalStatus = Literal["approved", "needs_revision", "blocked", "accepted", "needs_followup"]
 RoundType = Literal[
     "authoring",
+    "lead_response",
     "review",
     "review_retry",
     "adversarial_review",
@@ -290,10 +301,18 @@ class PlanChecklistItem:
     label: str
     owner: TeamRole = "lead"
     completed: bool = False
+    depends_on: list[str] = field(default_factory=list)
     id: str = field(default_factory=lambda: _new_id("check"))
 
     def to_dict(self) -> dict[str, object]:
-        return {"id": self.id, "label": self.label, "owner": self.owner, "completed": self.completed}
+        return {
+            "id": self.id,
+            "label": self.label,
+            "owner": self.owner,
+            "completed": self.completed,
+            "status": "done" if self.completed else "pending",
+            "depends_on": self.depends_on,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "PlanChecklistItem":
@@ -301,6 +320,7 @@ class PlanChecklistItem:
             label=str(data["label"]),
             owner=data.get("owner", "lead"),
             completed=bool(data.get("completed", False)),
+            depends_on=[str(item) for item in data.get("depends_on", [])] if isinstance(data.get("depends_on", []), list) else [],
             id=str(data["id"]),
         )
 
@@ -439,9 +459,9 @@ class RoundController:
     def validate_approve(self, session: "PlanSession") -> None:
         if session.status == "approved_for_execution":
             raise ValueError("team approve cannot re-approve a plan that is already approved")
-        if session.status != "needs_revision" or session.gate_verdict != "needs_revision":
-            raise ValueError("team approve requires a needs_revision plan session before approval")
-        if session.resume.current_phase != "in_review" or session.resume.pending_role != "lead":
+        if session.status not in {"needs_revision", "awaiting_human_confirmation"}:
+            raise ValueError("team approve requires a reviewed plan session awaiting human confirmation")
+        if session.resume.current_phase not in {"in_review", "awaiting_human_confirmation"} or session.resume.pending_role != "lead":
             raise ValueError("team approve requires the lead review handoff to be active")
         if not _checklist_item_completed_support(session.checklist, "Review round completed"):
             raise ValueError("team approve requires the review round completed checklist item")
@@ -449,14 +469,19 @@ class RoundController:
             raise ValueError("team approve requires all open gaps to be closed before approval")
 
     def validate_execute(self, session: "PlanSession") -> None:
-        if session.gate_verdict != "approved" or session.status != "approved_for_execution":
-            raise ValueError("team execute requires an approved plan session before execution")
+        validate_execution_gate(status=session.status, gate_verdict=session.gate_verdict)
         if session.resume.current_phase != "approved":
             raise ValueError("team execute requires a session in the approved phase before execution")
         if not _checklist_item_completed_support(session.checklist, "Execution approved"):
             raise ValueError("team execute requires the Execution approved checklist item")
 
     def normalize_resume(self, session: "PlanSession") -> "PlanSession":
+        if (
+            session.status in {"intake_chat", "draft_ready", "adversarial_review", "awaiting_human_confirmation"}
+        ):
+            session.resume.current_phase = session.status
+            session.resume.pending_role = "lead"
+            return session
         if (
             session.status == "executing"
             and session.resume.linked_execution_run_id
@@ -495,8 +520,8 @@ class RoundController:
         return session
 
     def validate_revision(self, session: "PlanSession", closed_gap_ids: list[str]) -> None:
-        if session.status != "needs_revision" or session.gate_verdict != "needs_revision":
-            raise ValueError("team revise requires a needs_revision plan session")
+        if session.status not in {"needs_revision", "awaiting_human_confirmation"} or session.gate_verdict != "needs_revision":
+            raise ValueError("team revise requires a reviewed plan session with open revision gaps")
         if not closed_gap_ids:
             raise ValueError("team revise requires at least one gap to close")
         known_gap_ids = {gap.id for gap in session.gaps}
@@ -754,6 +779,7 @@ class TeamOrchestrator:
     round_controller: RoundController = field(default_factory=RoundController)
     project_root: Path | str = field(default_factory=Path.cwd)
     provider_health_check: Any = field(default_factory=ProviderHealthCheck)
+    agent_config: AgentConfig = field(default_factory=AgentConfig.defaults)
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
@@ -769,6 +795,9 @@ class TeamOrchestrator:
         contract = self.orchestrator.planner.clarify(requirement, policy)
         work_units = self.orchestrator.decomposer.decompose(contract, policy)
         session = PlanSession.new(requirement=requirement, stage_target=self.stage_target)
+        session.status = "intake_chat"
+        session.resume.current_phase = "intake_chat"
+        session.resume.pending_role = "lead"
         session.doc_sync = self._build_doc_sync_status()
         session.compliance = build_compliance_status_for_session(
             project_root=self.project_root,
@@ -811,16 +840,30 @@ class TeamOrchestrator:
         )
         session.checklist = [
             PlanChecklistItem(label="Lead brief persisted", owner="lead", completed=True),
-            PlanChecklistItem(label="Review round completed", owner="review", completed=False),
-            PlanChecklistItem(label="Execution approved", owner="lead", completed=False),
+            PlanChecklistItem(label="Draft confirmed by human", owner="human", completed=False, depends_on=["Lead brief persisted"]),
+            PlanChecklistItem(label="Review round completed", owner="review", completed=False, depends_on=["Draft confirmed by human"]),
+            PlanChecklistItem(label="Execution approved", owner="lead", completed=False, depends_on=["Review round completed"]),
         ]
-        research_provider = "claude" if self.runtime.__class__.__name__ == "CommandJobRuntime" else "mock"
+        planner_profile = self.agent_config.profile("planner")
+        review_profile = self.agent_config.profile("plan_reviewer")
+        adversarial_profile = self.agent_config.profile("adversarial_reviewer")
+        research_provider = planner_profile.provider
         provider_recommendation = self._build_provider_recommendation()
-        runtime_review_provider = str(provider_recommendation.get("reviewer", "mock"))
+        runtime_review_provider = str(provider_recommendation.get("reviewer", review_profile.provider))
+        adversarial_review_provider = str(
+            provider_recommendation.get("adversarial_reviewer", adversarial_profile.provider)
+        )
         session.structured_brief.provider_recommendation = _recommend_provider_runtime(
             self.runtime,
             author_provider=str(provider_recommendation.get("author", "codex")),
             reviewer_provider=runtime_review_provider,
+            adversarial_reviewer_provider=adversarial_review_provider,
+            worker_model=self.agent_config.profile("worker").model,
+            reviewer_model=review_profile.model,
+            adversarial_reviewer_model=adversarial_profile.model,
+            author_runtime_mode=self.agent_config.profile("worker").runtime_mode,
+            reviewer_runtime_mode=review_profile.runtime_mode,
+            adversarial_reviewer_runtime_mode=adversarial_profile.runtime_mode,
             author_fallback_from=_string_or_none(provider_recommendation.get("author_fallback_from")),
             author_fallback_reason=_string_or_none(provider_recommendation.get("author_fallback_reason")),
             author_fallback_detail=_string_or_none(provider_recommendation.get("author_fallback_detail")),
@@ -840,14 +883,22 @@ class TeamOrchestrator:
         )
         message_router = MessageRouter(self.store.message_store())
 
-        lead_job = self.runtime.start(
+        lead_job = self._start_job(
             JobRequest(
                 task_id=session.id,
                 provider=research_provider,
                 kind="research",
-                prompt=f"Lead planning round: {requirement}",
+                prompt=planner_profile.render_prompt(
+                    f"Lead planning round: {requirement}",
+                    requirement=requirement,
+                    session_id=session.id,
+                ),
                 cwd=str(Path.cwd()),
-                metadata={"stage_target": self.stage_target, "role": "lead"},
+                model=planner_profile.model,
+                reasoning_effort=planner_profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=planner_profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=planner_profile.runtime_mode,
+                metadata={"stage_target": self.stage_target, "role": "lead", "agent_profile": planner_profile.to_dict()},
             )
         )
         if hasattr(self.runtime, "complete"):
@@ -866,13 +917,139 @@ class TeamOrchestrator:
                 f"via {lead_job.provider} job {lead_job.id}."
             ),
         )
-        review_result = _review_plan(requirement, session)
-        review_request = message_router.build_review_request(
+        session.review_rounds = [author_round]
+        session.resume.active_round_id = author_round.id
+        validate_artifact_write("lead", "draft_plan")
+        message_router.build_handoff(
+            session_id=session.id,
+            from_role="human",
+            to_role="lead",
+            content=requirement,
+            work_unit_id=session.id,
+            payload={"artifact_kind": "user_requirement", "stage": "intake_chat"},
+        )
+        message_router.build_handoff(
+            session_id=session.id,
+            from_role="lead",
+            to_role="human",
+            content=session.lead_brief,
+            work_unit_id=author_round.id,
+            payload={
+                "artifact_kind": "draft_plan",
+                "plan_version": len(session.review_rounds),
+                "goal": session.structured_brief.goal,
+                "subtask_ids": [subtask.id for subtask in session.subtasks],
+                "next_stage": "draft_ready",
+            },
+        )
+        session.structured_brief.risks = []
+        session.structured_brief.review_disputes = _summarize_review_disputes(session.review_rounds)
+        session.structured_brief.decision_rationale = _build_decision_rationale(requirement, session, policy)
+        session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
+        session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime)
+
+        self.store.write_session(session)
+        session.compliance = build_compliance_status_for_session(
+            project_root=self.project_root,
+            doc_sync=session.doc_sync,
+            session=session,
+            run_store=self.orchestrator.run_store,
+            plans_root=self.store.root,
+        )
+        self.store.write_session(session)
+        return session
+
+    def chat_with_lead(self, session_id: str, *, message: str) -> PlanSession:
+        session = self.store.read_session(session_id)
+        if session.status not in {"intake_chat", "draft_ready", "awaiting_human_confirmation", "needs_revision"}:
+            raise ValueError("lead chat is only available before approval or while human confirmation is pending")
+        text = message.strip()
+        if not text:
+            raise ValueError("lead chat requires a non-empty message")
+        validate_role_state_action("lead", "respond_to_user")
+        router = MessageRouter(self.store.message_store())
+        router.build_handoff(
+            session_id=session.id,
+            from_role="human",
+            to_role="lead",
+            content=text,
+            work_unit_id=session.id,
+            payload={"stage": session.status, "artifact_kind": "human_feedback"},
+            requires_response=True,
+        )
+        response = f"Lead incorporated human feedback into draft plan: {text}"
+        response_round = PlanReviewRound(round_type="lead_response", role="lead", summary=response)
+        session.review_rounds.append(response_round)
+        session.resume.active_round_id = response_round.id
+        session.resume.current_phase = session.status
+        session.resume.pending_role = "lead"
+        session.lead_brief = f"{session.lead_brief}\nHuman feedback: {text}".strip()
+        validate_artifact_write("lead", "lead_response")
+        router.build_handoff(
+            session_id=session.id,
+            from_role="lead",
+            to_role="human",
+            content=response,
+            work_unit_id=response_round.id,
+            payload={
+                "artifact_kind": "lead_response",
+                "plan_version": len(session.review_rounds),
+                "stage": session.status,
+            },
+        )
+        session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
+        self.store.write_session(session)
+        return session
+
+    def mark_draft_ready(self, session_id: str) -> PlanSession:
+        session = self.store.read_session(session_id)
+        if session.status not in {"intake_chat", "draft_ready"}:
+            raise ValueError("team draft-ready requires an intake_chat session")
+        validate_role_state_action("lead", "submit_draft")
+        session.status = "draft_ready"
+        session.resume.current_phase = "draft_ready"
+        session.resume.pending_role = "lead"
+        session.resume.submitted_at = "draft_ready"
+        _set_checklist_completed(session, "Draft confirmed by human", True)
+        session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
+        MessageRouter(self.store.message_store()).build_handoff(
+            session_id=session.id,
+            from_role="human",
+            to_role="lead",
+            content="First draft confirmed for adversarial review.",
+            work_unit_id=session.id,
+            payload={"artifact_kind": "draft_plan", "stage": "draft_ready"},
+        )
+        self.store.write_session(session)
+        return session
+
+    def submit_draft_for_review(self, session_id: str) -> PlanSession:
+        session = self.store.read_session(session_id)
+        if session.status != "draft_ready":
+            raise ValueError("team submit-review requires a draft_ready plan session")
+        validate_role_state_action("lead", "submit_draft")
+        review_profile = self.agent_config.profile("plan_reviewer")
+        adversarial_profile = self.agent_config.profile("adversarial_reviewer")
+        provider_recommendation = self._build_provider_recommendation()
+        runtime_review_provider = str(provider_recommendation.get("reviewer", review_profile.provider))
+        adversarial_review_provider = str(
+            provider_recommendation.get("adversarial_reviewer", adversarial_profile.provider)
+        )
+        router = MessageRouter(self.store.message_store())
+
+        session.status = "adversarial_review"
+        session.resume.current_phase = "adversarial_review"
+        session.resume.pending_role = "review"
+        self.store.write_session(session)
+
+        review_result = _review_plan(session.requirement, session)
+        review_request = router.build_review_request(
             session_id=session.id,
             to_role="reviewer",
-            content=f"Review the drafted plan for: {requirement}",
+            content=f"Review the human-confirmed draft plan for: {session.requirement}",
             work_unit_id=session.id,
             payload={
+                "artifact_kind": "draft_plan",
                 "goal": session.structured_brief.goal,
                 "subtask_ids": [subtask.id for subtask in session.subtasks],
                 "round_type": "review",
@@ -883,11 +1060,20 @@ class TeamOrchestrator:
                 task_id=session.id,
                 provider=runtime_review_provider,
                 kind="review",
-                prompt=f"Review planning round: {requirement}",
+                prompt=review_profile.render_prompt(
+                    f"Review human-confirmed draft plan: {session.requirement}",
+                    requirement=session.requirement,
+                    session_id=session.id,
+                ),
                 cwd=str(Path.cwd()),
+                model=review_profile.model,
+                reasoning_effort=review_profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=review_profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=review_profile.runtime_mode,
                 metadata={
                     "stage_target": self.stage_target,
-                    "role": "review",
+                    "role": "reviewer",
+                    "agent_profile": review_profile.to_dict(),
                     "work_unit_id": session.id,
                     "message_ids": [review_request.id],
                 },
@@ -907,41 +1093,57 @@ class TeamOrchestrator:
             summary=f"{review_result.summary} via {review_job.provider} review job {review_job.id}.",
             review_result=review_result,
         )
-        message_router.build_review_result(
+        validate_artifact_write("reviewer", "review_findings")
+        router.build_review_result(
             session_id=session.id,
             from_role="reviewer",
             content=review_result.summary,
             work_unit_id=review_round.id,
             payload={
+                "artifact_kind": "review_findings",
                 "job_id": review_job.id,
                 "review_round_id": review_round.id,
                 "review_result": review_result.to_dict(),
                 "reply_to_message_id": review_request.id,
             },
         )
-        adversarial_result = _adversarial_review_plan(requirement, session)
-        adversarial_request = message_router.build_review_request(
+
+        adversarial_result = _adversarial_review_plan(session.requirement, session)
+        adversarial_request = router.build_review_request(
             session_id=session.id,
             to_role="adversarial_reviewer",
-            content=f"Challenge the drafted plan adversarially for: {requirement}",
+            content=f"Challenge the reviewed draft plan adversarially for: {session.requirement}",
             work_unit_id=session.id,
             payload={
+                "artifact_kind": "draft_plan",
                 "goal": session.structured_brief.goal,
                 "subtask_ids": [subtask.id for subtask in session.subtasks],
                 "round_type": "adversarial_review",
+                "counterpart_round_id": review_round.id,
             },
         )
         adversarial_job = self._start_job(
             JobRequest(
                 task_id=session.id,
-                provider=runtime_review_provider,
+                provider=adversarial_review_provider,
                 kind="adversarial_review",
-                prompt=f"Adversarial review planning round: {requirement}",
+                prompt=adversarial_profile.render_prompt(
+                    f"Adversarial review human-confirmed draft plan: {session.requirement}",
+                    requirement=session.requirement,
+                    session_id=session.id,
+                    counterpart_provider=runtime_review_provider,
+                    counterpart_model=review_profile.model or "",
+                ),
                 cwd=str(Path.cwd()),
+                model=adversarial_profile.model,
+                reasoning_effort=adversarial_profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=adversarial_profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=adversarial_profile.runtime_mode,
                 metadata={
                     "stage_target": self.stage_target,
-                    "role": "review",
+                    "role": "adversarial_reviewer",
                     "round_type": "adversarial_review",
+                    "agent_profile": adversarial_profile.to_dict(),
                     "work_unit_id": session.id,
                     "message_ids": [adversarial_request.id],
                 },
@@ -961,57 +1163,41 @@ class TeamOrchestrator:
             summary=f"{adversarial_result.summary} via {adversarial_job.provider} adversarial_review job {adversarial_job.id}.",
             review_result=adversarial_result,
         )
-        message_router.build_review_result(
+        validate_artifact_write("adversarial_reviewer", "review_findings")
+        router.build_review_result(
             session_id=session.id,
             from_role="adversarial_reviewer",
             content=adversarial_result.summary,
             work_unit_id=adversarial_round.id,
             payload={
+                "artifact_kind": "review_findings",
                 "job_id": adversarial_job.id,
                 "review_round_id": adversarial_round.id,
                 "review_result": adversarial_result.to_dict(),
                 "reply_to_message_id": adversarial_request.id,
             },
         )
-        session.review_rounds = [author_round, review_round, adversarial_round]
-        session.resume.active_round_id = adversarial_round.id
-        session.resume.current_phase = "in_review"
-        session.resume.pending_role = "lead"
-        session.checklist[1].completed = True
 
+        session.review_rounds.extend([review_round, adversarial_round])
+        session.gaps = _build_plan_gaps(session.review_rounds)
         all_findings = [
             finding
             for round_ in session.review_rounds
             if round_.review_result
             for finding in round_.review_result.findings
         ]
-        session.gaps = _build_plan_gaps(session.review_rounds)
-
         outcome = self.round_controller.derive_post_review_outcome(all_findings)
-        session.status = outcome.status
+        session.status = "awaiting_human_confirmation"
         session.gate_verdict = outcome.gate_verdict
-        if outcome.status == "approved_for_execution":
-            session.resume.current_phase = "approved"
-            session.resume.approved_at = "approved"
-            session.checklist[2].completed = True
-            session.approved_plan = _build_approved_plan(session)
-
+        session.resume.current_phase = "awaiting_human_confirmation"
+        session.resume.pending_role = "lead"
+        session.resume.active_round_id = adversarial_round.id
+        _set_checklist_completed(session, "Review round completed", True)
+        _set_checklist_completed(session, "Execution approved", False)
         session.structured_brief.risks = _summarize_plan_risks(all_findings)
         session.structured_brief.review_disputes = _summarize_review_disputes(session.review_rounds)
-        session.structured_brief.decision_rationale = _build_decision_rationale(requirement, session, policy)
         session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
         session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime)
-        if session.approved_plan is not None:
-            session.approved_plan = _build_approved_plan(session)
-
-        self.store.write_session(session)
-        session.compliance = build_compliance_status_for_session(
-            project_root=self.project_root,
-            doc_sync=session.doc_sync,
-            session=session,
-            run_store=self.orchestrator.run_store,
-            plans_root=self.store.root,
-        )
         self.store.write_session(session)
         return session
 
@@ -1088,22 +1274,34 @@ class TeamOrchestrator:
             return status
         return ProviderStatus(provider="mock", available=False, detail=status.detail)
 
-    def _configured_review_provider(self, session: PlanSession) -> str | None:
-        configured = session.structured_brief.provider_recommendation.get("reviewer")
+    def _configured_review_provider(self, session: PlanSession, *, role: str = "reviewer") -> str | None:
+        key = "adversarial_reviewer" if role == "adversarial_reviewer" else "reviewer"
+        configured = session.structured_brief.provider_recommendation.get(key)
         return configured if isinstance(configured, str) and configured else None
 
     def _build_provider_recommendation(self) -> dict[str, object]:
+        author_profile = self.agent_config.profile("worker")
+        reviewer_profile = self.agent_config.profile("plan_reviewer")
+        adversarial_profile = self.agent_config.profile("adversarial_reviewer")
         author_provider, author_status, author_fallback_from = self._resolve_provider_choice(
-            preferred="codex",
+            preferred=author_profile.provider,
             fallbacks=("claude", "mock"),
         )
         reviewer_provider, reviewer_status, reviewer_fallback_from = self._resolve_provider_choice(
-            preferred="claude",
+            preferred=reviewer_profile.provider,
+            fallbacks=("codex", "claude", "mock"),
+        )
+        adversarial_provider, adversarial_status, adversarial_fallback_from = self._resolve_provider_choice(
+            preferred=adversarial_profile.provider,
             fallbacks=("codex", "mock"),
         )
         recommendation: dict[str, object] = {
             "author": author_provider,
             "reviewer": reviewer_provider,
+            "adversarial_reviewer": adversarial_provider,
+            "author_model": author_profile.model,
+            "reviewer_model": reviewer_profile.model,
+            "adversarial_reviewer_model": adversarial_profile.model,
         }
         if author_fallback_from is not None and author_fallback_from != author_provider:
             recommendation["author_fallback_from"] = author_fallback_from
@@ -1115,6 +1313,11 @@ class TeamOrchestrator:
             recommendation["preferred_reviewer"] = reviewer_fallback_from
             recommendation["fallback_reason"] = "reviewer_unavailable"
             recommendation["fallback_detail"] = reviewer_status.detail
+        if adversarial_fallback_from is not None and adversarial_fallback_from != adversarial_provider:
+            recommendation["adversarial_fallback_from"] = adversarial_fallback_from
+            recommendation["preferred_adversarial_reviewer"] = adversarial_fallback_from
+            recommendation["adversarial_fallback_reason"] = "adversarial_reviewer_unavailable"
+            recommendation["adversarial_fallback_detail"] = adversarial_status.detail
         return recommendation
 
     def _resolve_provider_choice(
@@ -1143,8 +1346,8 @@ class TeamOrchestrator:
         status = checker(provider) if callable(checker) else checker.check(provider)
         return status
 
-    def _selected_retry_provider(self, session: PlanSession, runtime_status: Any) -> str:
-        configured = self._configured_review_provider(session)
+    def _selected_retry_provider(self, session: PlanSession, runtime_status: Any, *, role: str = "reviewer") -> str:
+        configured = self._configured_review_provider(session, role=role)
         if configured:
             return configured
         provider = getattr(runtime_status, "provider", None)
@@ -1164,7 +1367,7 @@ class TeamOrchestrator:
         session.resume.active_round_id = retry_round.id
         session.resume.current_phase = "in_review"
         session.resume.pending_role = "lead"
-        session.checklist[1].completed = True
+        _set_checklist_completed(session, "Review round completed", True)
 
         historical_rounds = [round_ for round_ in session.review_rounds if round_.round_type not in replaced_round_types]
         session.gaps = _build_plan_gaps([*historical_rounds, retry_round])
@@ -1182,9 +1385,9 @@ class TeamOrchestrator:
         if outcome.status == "approved_for_execution":
             session.resume.current_phase = "approved"
             session.resume.approved_at = "approved"
-            session.checklist[2].completed = True
+            _set_checklist_completed(session, "Execution approved", True)
         else:
-            session.checklist[2].completed = False
+            _set_checklist_completed(session, "Execution approved", False)
 
         session.structured_brief.risks = _summarize_plan_risks(all_findings)
         session.structured_brief.review_disputes = _summarize_review_disputes(session.review_rounds)
@@ -1254,11 +1457,12 @@ class TeamOrchestrator:
         )
         _validate_compliance_ready(session)
         self.round_controller.validate_approve(session)
+        validate_role_state_action("lead", "approve_plan")
         session.status = "approved_for_execution"
         session.gate_verdict = "approved"
         session.resume.current_phase = "approved"
         session.resume.approved_at = "approved"
-        session.checklist[2].completed = True
+        _set_checklist_completed(session, "Execution approved", True)
         approval_round = PlanReviewRound(
             round_type="approval",
             role="lead",
@@ -1268,6 +1472,7 @@ class TeamOrchestrator:
         session.resume.active_round_id = approval_round.id
         session.structured_brief.decision_rationale = _build_decision_rationale(session.requirement, session, get_policy(OrchestrationMode.SUCCESS_FIRST))
         session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime)
+        validate_artifact_write("lead", "approved_plan")
         session.approved_plan = _build_approved_plan(session)
         session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
         if self._can_refresh_process_docs():
@@ -1286,7 +1491,7 @@ class TeamOrchestrator:
             to_role="runtime",
             content="Plan approved for execution.",
             work_unit_id=session.id,
-            payload={"status": session.status, "gate_verdict": session.gate_verdict},
+            payload={"artifact_kind": "approved_plan", "status": session.status, "gate_verdict": session.gate_verdict},
         )
         return session
 
@@ -1356,6 +1561,7 @@ class TeamOrchestrator:
         )
         _validate_compliance_ready(session)
         self.round_controller.validate_execute(session)
+        validate_role_state_action("builder", "execute_work_unit")
         if session.approved_plan is None:
             raise ValueError("team execute requires an approved plan artifact before execution")
         if review_policy_override not in {None, "", "auto"} or provider_health_snapshot:
@@ -1548,6 +1754,7 @@ class TeamOrchestrator:
         if runtime_status is None or runtime_status.status != "failed":
             raise ValueError("team retry-review requires a failed delegated review job")
 
+        review_profile = self.agent_config.profile("plan_reviewer")
         review_provider = self._selected_retry_provider(session, runtime_status)
         review_result = _review_plan(session.requirement, session)
         message_router = MessageRouter(self.store.message_store())
@@ -1563,12 +1770,21 @@ class TeamOrchestrator:
                 task_id=session.id,
                 provider=review_provider,
                 kind="review",
-                prompt=f"Retry review planning round: {session.requirement}",
+                prompt=review_profile.render_prompt(
+                    f"Retry review planning round: {session.requirement}",
+                    requirement=session.requirement,
+                    session_id=session.id,
+                ),
                 cwd=str(Path.cwd()),
+                model=review_profile.model,
+                reasoning_effort=review_profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=review_profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=review_profile.runtime_mode,
                 metadata={
                     "stage_target": self.stage_target,
-                    "role": "review",
+                    "role": "reviewer",
                     "round_type": "review_retry",
+                    "agent_profile": review_profile.to_dict(),
                     "work_unit_id": review_round.id,
                     "message_ids": [retry_request.id],
                 },
@@ -1618,7 +1834,8 @@ class TeamOrchestrator:
         if runtime_status is None or runtime_status.status != "failed":
             raise ValueError("team retry-adversarial-review requires a failed delegated adversarial review job")
 
-        review_provider = self._selected_retry_provider(session, runtime_status)
+        adversarial_profile = self.agent_config.profile("adversarial_reviewer")
+        review_provider = self._selected_retry_provider(session, runtime_status, role="adversarial_reviewer")
         adversarial_result = _adversarial_review_plan(session.requirement, session)
         message_router = MessageRouter(self.store.message_store())
         retry_request = message_router.build_review_request(
@@ -1633,12 +1850,21 @@ class TeamOrchestrator:
                 task_id=session.id,
                 provider=review_provider,
                 kind="adversarial_review",
-                prompt=f"Retry adversarial review planning round: {session.requirement}",
+                prompt=adversarial_profile.render_prompt(
+                    f"Retry adversarial review planning round: {session.requirement}",
+                    requirement=session.requirement,
+                    session_id=session.id,
+                ),
                 cwd=str(Path.cwd()),
+                model=adversarial_profile.model,
+                reasoning_effort=adversarial_profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=adversarial_profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=adversarial_profile.runtime_mode,
                 metadata={
                     "stage_target": self.stage_target,
-                    "role": "review",
+                    "role": "adversarial_reviewer",
                     "round_type": "adversarial_review_retry",
+                    "agent_profile": adversarial_profile.to_dict(),
                     "work_unit_id": adversarial_round.id,
                     "message_ids": [retry_request.id],
                 },
@@ -1935,7 +2161,9 @@ def _observed_failure_provider(runtime_status: Any, session: PlanSession) -> str
 
 
 def _planned_recovery_provider(session: PlanSession, runtime_status: Any) -> str | None:
-    configured = session.structured_brief.provider_recommendation.get("reviewer")
+    round_type = getattr(runtime_status, "kind", None)
+    key = "adversarial_reviewer" if round_type == "adversarial_review" else "reviewer"
+    configured = session.structured_brief.provider_recommendation.get(key)
     if isinstance(configured, str) and configured:
         provider = configured
     else:
@@ -1950,10 +2178,6 @@ def _recovery_policy_for_session(
     provider_mode: str = "observed",
 ) -> dict[str, str | None]:
     recommendation = session.structured_brief.provider_recommendation
-    reviewer = recommendation.get("reviewer")
-    fallback_from = recommendation.get("fallback_from")
-    fallback_reason = recommendation.get("fallback_reason")
-    fallback_detail = recommendation.get("fallback_detail")
     latest_review = _latest_round_support(session.review_rounds, "review")
     latest_adversarial = _latest_round_support(session.review_rounds, "adversarial_review")
     candidate_order: list[tuple[str, PlanReviewRound | None]] = []
@@ -1973,21 +2197,38 @@ def _recovery_policy_for_session(
                 provider = _planned_recovery_provider(session, runtime_status)
             else:
                 provider = _observed_failure_provider(runtime_status, session)
+            fallback = _review_fallback_fields(recommendation, round_type)
             return {
                 "round_type": round_type,
                 "provider": provider,
                 "provider_mode": provider_mode,
-                "fallback_from": str(fallback_from) if isinstance(fallback_from, str) else None,
-                "fallback_reason": str(fallback_reason) if isinstance(fallback_reason, str) else None,
-                "fallback_detail": str(fallback_detail) if isinstance(fallback_detail, str) else None,
+                "fallback_from": fallback["fallback_from"],
+                "fallback_reason": fallback["fallback_reason"],
+                "fallback_detail": fallback["fallback_detail"],
             }
+    fallback = _review_fallback_fields(recommendation, "review")
+    reviewer = recommendation.get("reviewer")
     return {
         "round_type": None,
         "provider": str(reviewer) if isinstance(reviewer, str) else None,
         "provider_mode": None,
-        "fallback_from": str(fallback_from) if isinstance(fallback_from, str) else None,
-        "fallback_reason": str(fallback_reason) if isinstance(fallback_reason, str) else None,
-        "fallback_detail": str(fallback_detail) if isinstance(fallback_detail, str) else None,
+        "fallback_from": fallback["fallback_from"],
+        "fallback_reason": fallback["fallback_reason"],
+        "fallback_detail": fallback["fallback_detail"],
+    }
+
+
+def _review_fallback_fields(recommendation: dict[str, object], round_type: str) -> dict[str, str | None]:
+    if round_type == "adversarial_review":
+        return {
+            "fallback_from": _string_or_none(recommendation.get("adversarial_fallback_from")),
+            "fallback_reason": _string_or_none(recommendation.get("adversarial_fallback_reason")),
+            "fallback_detail": _string_or_none(recommendation.get("adversarial_fallback_detail")),
+        }
+    return {
+        "fallback_from": _string_or_none(recommendation.get("fallback_from")),
+        "fallback_reason": _string_or_none(recommendation.get("fallback_reason")),
+        "fallback_detail": _string_or_none(recommendation.get("fallback_detail")),
     }
 
 
@@ -2201,10 +2442,30 @@ def _build_approved_plan(session: PlanSession) -> dict[str, object]:
 
 
 def _build_checklist_summary(checklist: list[PlanChecklistItem]) -> list[str]:
+    next_item = _next_executable_checklist_item(checklist)
     return [
-        f"{item.label} [{item.owner}]: {'done' if item.completed else 'pending'}"
+        (
+            f"{item.label} [{item.owner}]: {'done' if item.completed else 'pending'}"
+            + (f" depends_on={','.join(item.depends_on)}" if item.depends_on else "")
+            + (" next_executable" if next_item is not None and item.id == next_item.id else "")
+        )
         for item in checklist
     ]
+
+
+def _next_executable_checklist_item(checklist: list[PlanChecklistItem]) -> PlanChecklistItem | None:
+    completed_labels = {item.label for item in checklist if item.completed}
+    for item in checklist:
+        if not item.completed and all(label in completed_labels for label in item.depends_on):
+            return item
+    return None
+
+
+def _set_checklist_completed(session: PlanSession, label: str, completed: bool) -> None:
+    for item in session.checklist:
+        if item.label == label:
+            item.completed = completed
+            return
 
 
 def _build_plan_execution_contract(session: PlanSession) -> dict[str, object]:
@@ -2217,7 +2478,11 @@ def _build_plan_execution_contract(session: PlanSession) -> dict[str, object]:
         topology={
             "selected_topology": decision_verdict.get("selected_topology"),
             "selected_mode": "success_first",
-            "provider_flow": [provider_recommendation.get("reviewer"), provider_recommendation.get("author"), provider_recommendation.get("reviewer")]
+            "provider_flow": [
+                provider_recommendation.get("reviewer"),
+                provider_recommendation.get("author"),
+                provider_recommendation.get("adversarial_reviewer"),
+            ]
             if decision_verdict.get("selected_topology") == "team_with_adversarial_review"
             else [provider_recommendation.get("author")],
             "work_unit_count": len(session.structured_brief.subtasks),
@@ -2248,6 +2513,14 @@ def _fallback_policy_from_provider_recommendation(provider_recommendation: dict[
             "fallback_from": provider_recommendation.get("fallback_from"),
             "fallback_reason": provider_recommendation.get("fallback_reason"),
             "fallback_detail": provider_recommendation.get("fallback_detail"),
+        },
+        "adversarial_reviewer": {
+            "preferred": provider_recommendation.get("preferred_adversarial_reviewer")
+            or provider_recommendation.get("adversarial_reviewer"),
+            "actual": provider_recommendation.get("adversarial_reviewer"),
+            "fallback_from": provider_recommendation.get("adversarial_fallback_from"),
+            "fallback_reason": provider_recommendation.get("adversarial_fallback_reason"),
+            "fallback_detail": provider_recommendation.get("adversarial_fallback_detail"),
         },
         "runtime": {
             "actual": provider_recommendation.get("runtime"),
@@ -2419,6 +2692,13 @@ def _recommend_provider_runtime(
     *,
     author_provider: str = "codex",
     reviewer_provider: str = "claude",
+    adversarial_reviewer_provider: str = "claude",
+    worker_model: str | None = None,
+    reviewer_model: str | None = None,
+    adversarial_reviewer_model: str | None = None,
+    author_runtime_mode: str = "cli_inherit",
+    reviewer_runtime_mode: str = "direct_api",
+    adversarial_reviewer_runtime_mode: str = "direct_api",
     author_fallback_from: str | None = None,
     author_fallback_reason: str | None = None,
     author_fallback_detail: str | None = None,
@@ -2429,7 +2709,15 @@ def _recommend_provider_runtime(
     recommendation = {
         "author": author_provider,
         "reviewer": reviewer_provider,
-        "runtime": "command" if runtime.__class__.__name__ == "CommandJobRuntime" else "mock",
+        "adversarial_reviewer": adversarial_reviewer_provider,
+        "author_model": worker_model,
+        "reviewer_model": reviewer_model,
+        "adversarial_reviewer_model": adversarial_reviewer_model,
+        "author_runtime_mode": author_runtime_mode,
+        "reviewer_runtime_mode": reviewer_runtime_mode,
+        "adversarial_reviewer_runtime_mode": adversarial_reviewer_runtime_mode,
+        "direct_api_scope": "planning/review/summarization only; no local tool loop",
+        "runtime": "command" if runtime.__class__.__name__ in {"CommandJobRuntime", "RuntimeModeRouter"} else "mock",
     }
     if author_fallback_from is not None and author_fallback_from != author_provider:
         recommendation["author_fallback_from"] = author_fallback_from
@@ -2688,6 +2976,7 @@ def _build_status_summary(session: PlanSession) -> PlanStatusSummary:
         preferred_round_type=preferred_recovery_round_type,
         provider_mode=recovery_provider_mode,
     )
+    next_checklist_item = _next_executable_checklist_item(session.checklist)
 
     return {
         "phase": session.resume.current_phase,
@@ -2699,6 +2988,8 @@ def _build_status_summary(session: PlanSession) -> PlanStatusSummary:
         "primary_action": guidance.primary_action,
         "primary_reason": guidance.primary_reason,
         "recommended_commands": guidance.recommended_commands,
+        "next_executable_checklist_item": next_checklist_item.to_dict() if next_checklist_item else None,
+        "checklist_dependencies": [item.to_dict() for item in session.checklist],
         "recovery_actions": guidance.recovery_actions,
         "recovery_round_type": recovery_policy.get("round_type"),
         "recovery_provider": recovery_policy.get("provider"),

@@ -20,10 +20,10 @@
 标准 happy path：
 
 1. `team start`
-2. `team status`
-3. `team next`
-4. `team revise`
-5. `team approve`
+2. `team chat`
+3. `team draft-ready`
+4. `team submit-review`
+5. `team revise` 或 `team approve`
 6. `team execute`
 7. `team inspect-execution`
 
@@ -31,6 +31,9 @@
 
 ```bash
 python -m agent_orchestrator.cli team start "Build a persisted plan artifact"
+python -m agent_orchestrator.cli team chat <session_id> --message "补充约束或确认方向"
+python -m agent_orchestrator.cli team draft-ready <session_id>
+python -m agent_orchestrator.cli team submit-review <session_id>
 python -m agent_orchestrator.cli team summary <session_id>
 python -m agent_orchestrator.cli team next <session_id>
 python -m agent_orchestrator.cli team runbook <session_id>
@@ -46,8 +49,54 @@ python -m agent_orchestrator.cli team runbook <session_id>
 - 当 preferred reviewer 不可用时，decision verdict 会记录 provider fallback
 - provider fallback 输出应包含 `fallback_reason` 和 `fallback_detail`
 - direct `run` 的 summary 现在也会展示 `route_source` 和 execution contract 摘要
+- Provider / Runtime 会标明 `cli_inherit`、`cli_isolated` 或 `direct_api`
+- `direct_api` 只用于 planning / review / summarization 这类低副作用角色；implementation / rescue 默认仍走 CLI worker
+- API key 只通过环境变量读取，setup/health 只展示 masked readiness
+
+## Provider / Runtime 模式
+
+- `cli_inherit`：默认 CLI 模式，继承本机 Codex / Claude Code 登录状态、全局规则、项目规则和 provider 原生命令能力。
+- `cli_isolated`：CLI 隔离模式，每个 job 使用 `.agent_orchestrator/runtime-homes/<job-id>/` 作为 HOME，并在 job metadata 中记录 effective home、config source 和 sandbox。
+- `direct_api`：API key 模式，只用于单轮治理型任务；没有本地工具循环、不会直接改文件，也不会把 API key 写入 job JSON、日志或 evidence。
+
+推荐策略：
+
+1. 计划、审查、证据总结优先看 `direct_api` 的干净控制面。
+2. 真正修改代码的 worker / rescue 优先用 `cli_inherit` 或 `cli_isolated`。
+3. 当输出里出现 provider fallback，先看 `fallback_reason` / `fallback_detail`，再决定是否重试或切换 runtime mode。
 
 ## 状态解释
+
+### `intake_chat`
+
+表示用户正在和计划主控 Lead 澄清需求。`team start` 只创建首版草案和可读消息，不会自动进入 review。
+
+操作顺序：
+
+1. 用 `team chat` 继续补充约束、边界、偏好。
+2. 用 `team summary` 或 Console 查看当前草案。
+3. 当第一版计划可以被审查时，运行 `team draft-ready`。
+
+### `draft_ready`
+
+表示用户已经确认第一版计划可以进入审查，但审查尚未开始。
+
+操作顺序：
+
+1. 如需继续补充，回到 `team chat`。
+2. 如确认进入下一阶段，运行 `team submit-review`。
+3. `submit-review` 会触发 reviewer 和 adversarial reviewer，但不会自动 approve。
+
+### `awaiting_human_confirmation`
+
+表示 review / adversarial review 已完成，系统正在等人类补充或批准。
+
+操作顺序：
+
+1. 用 `team summary` 查看 review findings 和 gaps。
+2. 如果 required gaps 存在，用 `team revise` 补充并关闭。
+3. 如果 required gaps 已关闭，运行 `team approve`。
+4. `team approve` 之后才允许 `team execute`。
 
 ### `needs_revision`
 

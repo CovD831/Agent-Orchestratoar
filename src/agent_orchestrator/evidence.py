@@ -345,6 +345,13 @@ def _capture_case(
         project_root=project_root,
     )
     session = team.start(case.requirement)
+    session = team.mark_draft_ready(session.id)
+    session = team.submit_draft_for_review(session.id)
+    required_open = [gap.id for gap in session.gaps if gap.required and gap.status != "closed"]
+    if required_open:
+        session = team.revise(session.id, summary="Evidence capture closes required review gaps.", closed_gap_ids=required_open)
+    if session.status != "approved_for_execution":
+        session = team.approve(session.id)
     executed = None
     execution_payload: dict[str, object] | None = None
     if session.status == "approved_for_execution":
@@ -664,6 +671,11 @@ def _team_advantages(
         advantages.append("recovery_guidance")
     if session.decision_verdict is not None and session.decision_verdict.selected_provider_runtime:
         advantages.append("provider_runtime_selection")
+        selected = session.decision_verdict.selected_provider_runtime
+        if any(str(selected.get(key)) == "direct_api" for key in ("reviewer_runtime_mode", "adversarial_reviewer_runtime_mode")):
+            advantages.append("direct_api_governance_roles")
+        if str(selected.get("author_runtime_mode")) == "cli_inherit":
+            advantages.append("cli_worker_default_preserved")
     doc_sync = signals.get("doc_sync", {}) if isinstance(signals.get("doc_sync"), dict) else {}
     if doc_sync.get("present"):
         advantages.append("doc_sync_snapshot")

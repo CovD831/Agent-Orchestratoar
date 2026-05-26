@@ -25,7 +25,7 @@ def create_app(service: DashboardService | None = None) -> Any:
 
     dashboard = service or build_dashboard_service()
     app = FastAPI(title="Agent Team Console")
-    static_dir = Path(__file__).with_name("ui_static")
+    static_dir = _static_assets_dir()
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/")
@@ -35,6 +35,14 @@ def create_app(service: DashboardService | None = None) -> Any:
     @app.get("/api/health")
     def health() -> dict[str, object]:
         return dashboard.health()
+
+    @app.get("/api/agent-config")
+    def get_agent_config() -> dict[str, object]:
+        return dashboard.get_agent_config()
+
+    @app.post("/api/agent-config")
+    def update_agent_config(payload: dict[str, object] = Body(...)) -> dict[str, object]:
+        return _call(lambda: dashboard.update_agent_config(payload), HTTPException)
 
     @app.get("/api/sessions")
     def list_sessions() -> dict[str, object]:
@@ -97,6 +105,18 @@ def create_app(service: DashboardService | None = None) -> Any:
         gap_ids = [str(item) for item in closed_gap_ids] if isinstance(closed_gap_ids, list) else []
         return _call(lambda: dashboard.revise_session(session_id, summary=str(payload.get("summary", "")), closed_gap_ids=gap_ids), HTTPException)
 
+    @app.post("/api/sessions/{session_id}/chat")
+    def chat_with_lead(session_id: str, payload: dict[str, object] = Body(...)) -> dict[str, object]:
+        return _call(lambda: dashboard.chat_with_lead(session_id, message=str(payload.get("message", ""))), HTTPException)
+
+    @app.post("/api/sessions/{session_id}/draft-ready")
+    def mark_draft_ready(session_id: str) -> dict[str, object]:
+        return _call(lambda: dashboard.mark_draft_ready(session_id), HTTPException)
+
+    @app.post("/api/sessions/{session_id}/submit-review")
+    def submit_draft_for_review(session_id: str) -> dict[str, object]:
+        return _call(lambda: dashboard.submit_draft_for_review(session_id), HTTPException)
+
     @app.post("/api/sessions/{session_id}/approve")
     def approve_session(session_id: str) -> dict[str, object]:
         return _call(lambda: dashboard.approve_session(session_id), HTTPException)
@@ -134,6 +154,18 @@ def create_app(service: DashboardService | None = None) -> Any:
     def get_job_log(job_id: str) -> dict[str, object]:
         return dashboard.get_job_log(job_id)
 
+    @app.get("/api/jobs/{job_id}/terminal/snapshot")
+    def get_job_terminal_snapshot(job_id: str) -> dict[str, object]:
+        return _call(lambda: dashboard.get_job_terminal_snapshot(job_id), HTTPException)
+
+    @app.post("/api/jobs/{job_id}/terminal/input")
+    def send_job_terminal_input(job_id: str, payload: dict[str, object] = Body(...)) -> dict[str, object]:
+        return _call(lambda: dashboard.send_job_terminal_input(job_id, str(payload.get("message", ""))), HTTPException)
+
+    @app.post("/api/jobs/{job_id}/terminal/reconnect")
+    def reconnect_job_terminal(job_id: str) -> dict[str, object]:
+        return _call(lambda: dashboard.reconnect_job_terminal(job_id), HTTPException)
+
     @app.post("/api/jobs/{job_id}/send")
     def send_job(job_id: str, payload: dict[str, object] = Body(...)) -> dict[str, object]:
         return _call(lambda: dashboard.send_job(job_id, str(payload.get("message", ""))), HTTPException)
@@ -153,7 +185,15 @@ def _call(fn: Any, http_exception: Any) -> Any:
     except FileNotFoundError as exc:
         raise http_exception(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise http_exception(status_code=400, detail=str(exc)) from exc
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+
+
+def _static_assets_dir() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    frontend_dist = repo_root / "ui_frontend" / "dist"
+    if (frontend_dist / "index.html").exists():
+        return frontend_dist
+    return Path(__file__).with_name("ui_static")
 
 
 def _sse_stream(

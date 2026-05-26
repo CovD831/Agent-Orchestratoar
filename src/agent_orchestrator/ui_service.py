@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_orchestrator.actions import assert_session_action_allowed, build_session_actions, primary_action_from_registry
+from agent_orchestrator.agent_config import AgentConfig, AgentConfigStore
 from agent_orchestrator.command import ProviderHealthCheck
 from agent_orchestrator.events import EventStore
 from agent_orchestrator.jobs import FileJobRuntime
@@ -25,8 +26,10 @@ from agent_orchestrator.work_graph import WorkGraphStore, WorkUnitGraph, graph_t
 
 
 TIMELINE_STEPS = [
-    ("drafting", "起草"),
-    ("in_review", "审核"),
+    ("intake_chat", "沟通"),
+    ("draft_ready", "初稿"),
+    ("adversarial_review", "审查"),
+    ("awaiting_human_confirmation", "确认"),
     ("needs_revision", "修订"),
     ("approved_for_execution", "已批准"),
     ("executing", "执行"),
@@ -63,11 +66,24 @@ class DashboardService:
         self.memory_store = MemoryStore(root=self.plans_root.parent / "memory")
         self.message_store = MessageStore(root=self.plans_root.parent / "messages")
         self.health_check = health_check or ProviderHealthCheck(use_cache=True)
+        self.agent_config_store = AgentConfigStore(self.plans_root.parent / "agent-config.json")
+        self.team.agent_config = self.agent_config_store.read()
+        _apply_agent_config_to_orchestrator(self.team.orchestrator, self.team.agent_config)
 
     def health(self) -> dict[str, object]:
         providers = [self.health_check.check(provider).to_dict() for provider in ("codex", "claude")]
         providers.append({"provider": "mock", "available": True, "detail": "mock provider is always available"})
         return {"providers": providers, "job_runtime": self.job_runtime.__class__.__name__}
+
+    def get_agent_config(self) -> dict[str, object]:
+        return self.agent_config_store.read().to_dict()
+
+    def update_agent_config(self, payload: dict[str, object]) -> dict[str, object]:
+        config = AgentConfig.from_dict(payload)
+        self.agent_config_store.write(config)
+        self.team.agent_config = config
+        _apply_agent_config_to_orchestrator(self.team.orchestrator, config)
+        return config.to_dict()
 
     def list_sessions(self) -> dict[str, object]:
         sessions = []
@@ -108,6 +124,24 @@ class DashboardService:
     def create_session(self, requirement: str) -> dict[str, object]:
         payload = self.team.start(requirement).to_dict()
         self._record_action("create_session", str(payload.get("id")), payload)
+        return payload
+
+    def chat_with_lead(self, session_id: str, *, message: str) -> dict[str, object]:
+        assert_session_action_allowed(self.team.status(session_id).to_dict(), "lead_chat", {"message": message})
+        payload = self.team.chat_with_lead(session_id, message=message).to_dict()
+        self._record_action("lead_chat", session_id, payload)
+        return payload
+
+    def mark_draft_ready(self, session_id: str) -> dict[str, object]:
+        assert_session_action_allowed(self.team.status(session_id).to_dict(), "mark_draft_ready")
+        payload = self.team.mark_draft_ready(session_id).to_dict()
+        self._record_action("mark_draft_ready", session_id, payload)
+        return payload
+
+    def submit_draft_for_review(self, session_id: str) -> dict[str, object]:
+        assert_session_action_allowed(self.team.status(session_id).to_dict(), "submit_review")
+        payload = self.team.submit_draft_for_review(session_id).to_dict()
+        self._record_action("submit_review", session_id, payload)
         return payload
 
     def create_ideation_session(self, requirement: str) -> dict[str, object]:
@@ -190,17 +224,40 @@ class DashboardService:
         path = self.jobs_root / f"{job_id}.log"
         return {"job_id": job_id, "log": path.read_text(encoding="utf-8") if path.exists() else ""}
 
+    def get_job_terminal_snapshot(self, job_id: str) -> dict[str, object]:
+        job = self.job_runtime.status(job_id)
+        card = _job_card(job.to_dict(), self.jobs_root)
+        return {
+            "job_id": card["id"],
+            "status": card["status"],
+            "phase": card["phase"],
+            "provider": card["provider"],
+            "model": card["model"],
+            "kind": card["kind"],
+            "terminal_ref": card["terminal_ref"],
+            "attach_available": card["attach_available"],
+            "stdout": card["stdout"] or "",
+            "summary": card["summary"],
+            "last_seen_at": card["last_seen_at"],
+        }
+
     def send_job(self, job_id: str, message: str) -> dict[str, object]:
         try:
             return _job_card(self.job_runtime.send(job_id, message).to_dict(), self.jobs_root)
         except KeyError:
             return _missing_job_operation(job_id, "send")
 
+    def send_job_terminal_input(self, job_id: str, message: str) -> dict[str, object]:
+        return self.send_job(job_id, message)
+
     def cancel_job(self, job_id: str) -> dict[str, object]:
         try:
             return _job_card(self.job_runtime.cancel(job_id).to_dict(), self.jobs_root)
         except KeyError:
             return _missing_job_operation(job_id, "cancel")
+
+    def reconnect_job_terminal(self, job_id: str) -> dict[str, object]:
+        return self.get_job_terminal_snapshot(job_id)
 
     def _record_action(self, action: str, session_id: str, payload: dict[str, object]) -> None:
         self.event_store.append(
@@ -226,6 +283,12 @@ def _read_json(path: Path) -> object:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _apply_agent_config_to_orchestrator(orchestrator: Any, config: AgentConfig) -> None:
+    for adapter in (getattr(orchestrator, "worker", None), getattr(orchestrator, "reviewer", None)):
+        if hasattr(adapter, "agent_config"):
+            adapter.agent_config = config
 
 
 def _work_graph_payload(graph: WorkUnitGraph) -> dict[str, object]:
@@ -405,6 +468,7 @@ def _delegated_job_card(job: dict[str, object]) -> dict[str, object]:
     return {
         "id": job.get("job_id"),
         "provider": job.get("provider") or "mock",
+        "model": job.get("model"),
         "kind": job.get("round_type") or "delegated",
         "status": job.get("status") or "unknown",
         "phase": "failed" if job.get("status") == "failed" else "done",
@@ -425,6 +489,7 @@ def _session_lead_card(payload: dict[str, object]) -> dict[str, object]:
     return {
         "id": payload.get("id"),
         "provider": "decision_core",
+        "model": None,
         "kind": "session_lead",
         "status": payload.get("status") or "unknown",
         "phase": summary.get("phase") or payload.get("status") or "unknown",
@@ -451,6 +516,7 @@ def _runtime_card(payload: dict[str, object]) -> dict[str, object]:
     return {
         "id": f"{payload.get('id')}-runtime",
         "provider": runtime,
+        "model": provider_runtime.get("author_model"),
         "kind": "runtime",
         "status": payload.get("status") or "unknown",
         "phase": "runtime",
@@ -834,6 +900,7 @@ def _job_card(job: dict[str, object], jobs_root: Path | None = None) -> dict[str
         "id": job_id,
         "task_id": job.get("task_id"),
         "provider": job.get("provider"),
+        "model": job.get("model"),
         "kind": job.get("kind"),
         "status": job.get("status"),
         "phase": job.get("phase"),

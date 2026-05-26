@@ -7,6 +7,7 @@ from pathlib import Path
 from time import sleep
 from typing import Any, Protocol, cast
 
+from agent_orchestrator.agent_config import AgentConfig, AgentProfile
 from agent_orchestrator.jobs import AgentJob, InMemoryJobRuntime, JobRequest, JobRuntime
 from agent_orchestrator.policies import OrchestrationMode, PolicyProfile
 from agent_orchestrator.review import Finding, ReviewResult
@@ -391,24 +392,30 @@ class RuntimeProviderAdapter:
     poll_interval_seconds: float = 0.01
     poll_attempts: int = 200
     provider_health_check: Any | None = None
+    agent_config: AgentConfig = field(default_factory=AgentConfig.defaults)
 
     def execute(self, work_unit: WorkUnit, policy: PolicyProfile) -> WorkUnitResult:
+        profile = self.agent_config.profile("worker")
         provider_selection = _provider_selection(
             work_unit,
-            default=self.default_provider,
+            default=profile.provider or self.default_provider,
             runtime=self.runtime,
             provider_health_check=self.provider_health_check,
             fallback_source="runtime_provider_adapter",
         )
         provider = provider_selection["actual_provider"]
+        prompt = _profile_prompt(profile, work_unit.goal, work_unit=work_unit)
         job = self.runtime.start(
             JobRequest(
                 task_id=work_unit.id,
                 provider=provider,  # type: ignore[arg-type]
                 kind=self.kind,  # type: ignore[arg-type]
-                prompt=work_unit.goal,
+                prompt=prompt,
                 cwd=str(Path.cwd()),
-                model=None,
+                model=profile.model,
+                reasoning_effort=profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=profile.runtime_mode,
                 max_depth=policy.max_depth,
                 metadata={
                     "context": work_unit.context,
@@ -497,6 +504,7 @@ class RuntimeProviderReviewRescueAdapter:
     poll_interval_seconds: float = 0.01
     poll_attempts: int = 200
     provider_health_check: Any | None = None
+    agent_config: AgentConfig = field(default_factory=AgentConfig.defaults)
 
     def review_or_rescue(
         self,
@@ -504,23 +512,34 @@ class RuntimeProviderReviewRescueAdapter:
         result: WorkUnitResult,
         policy: PolicyProfile,
     ) -> WorkUnitResult:
+        kind = "rescue" if result.status == "failed" and policy.rescue_enabled else "review"
+        profile = self.agent_config.profile("rescue" if kind == "rescue" else "execution_reviewer")
         provider_selection = _provider_selection(
             work_unit,
-            default=self.default_provider,
+            default=profile.provider or self.default_provider,
             runtime=self.runtime,
             provider_health_check=self.provider_health_check,
             fallback_source="runtime_provider_review_rescue_adapter",
         )
         provider = provider_selection["actual_provider"]
-        kind = "rescue" if result.status == "failed" and policy.rescue_enabled else "review"
         failure_reason = result.summary if kind == "rescue" else None
+        prompt = _profile_prompt(
+            profile,
+            f"{kind.title()} work unit: {work_unit.goal}",
+            work_unit=work_unit,
+            origin_status=result.status,
+        )
         job = self.runtime.start(
             JobRequest(
                 task_id=work_unit.id,
                 provider=provider,  # type: ignore[arg-type]
                 kind=kind,  # type: ignore[arg-type]
-                prompt=f"{kind.title()} work unit: {work_unit.goal}",
+                prompt=prompt,
                 cwd=str(Path.cwd()),
+                model=profile.model,
+                reasoning_effort=profile.reasoning_effort,  # type: ignore[arg-type]
+                sandbox=profile.sandbox,  # type: ignore[arg-type]
+                runtime_mode=profile.runtime_mode,
                 max_depth=policy.max_depth,
                 failure_reason=failure_reason,
                 metadata={
@@ -695,6 +714,10 @@ def _flow_provider(flow: tuple[str, ...], index: int, *, fallback: str) -> str:
     if index < len(flow):
         return flow[index]
     return fallback
+
+
+def _profile_prompt(profile: AgentProfile, default_prompt: str, **context: object) -> str:
+    return profile.render_prompt(default_prompt, **context)
 
 
 def _work_unit_provider(work_unit: WorkUnit, *, default: str) -> str:

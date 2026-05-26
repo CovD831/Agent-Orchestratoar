@@ -32,6 +32,11 @@ All implementation work remains mapped to the repository's three Chinese impleme
 | `research_repos/codex-orchestrator` | Background tmux jobs, `status/capture/send/watch/attach`, durable job metadata, output capture, codebase map injection | Job runtime ergonomics, operator console job cards, terminal refs, log excerpts, context-map prompt support | 执行拓扑层 + Provider / Runtime 层 | Borrow lifecycle and observability ideas, not a full session-manager product |
 | `research_repos/codex-plugin-cc` | Plugin bundle structure, install/update/uninstall scripts, semantic-version alignment, honest limitation reporting | Packaging docs, setup diagnostics, version/readiness checks, release readiness checklist | Provider / Runtime 层 | Borrow distribution discipline, not host-specific plugin assumptions |
 | `research_repos/cc-plugin-codex` | Reverse companion plugin, Codex-native skill bundle, install verification, explicit unavailable hook limitation | Cross-provider readiness, setup command language, limitation sections in docs | Provider / Runtime 层 | Borrow clarity around degraded capability, not runtime-specific hooks |
+| `research_repos/wanman` | Per-agent worktrees, isolated `$HOME`, JSON-RPC supervisor, long-lived matrix lifecycle | CLI runtime isolation, runtime-home metadata, future supervisor boundaries | Provider / Runtime 层 | Borrow isolation discipline, not the full matrix product |
+| `research_repos/slark` | CLI bridge plus SDK/API bypass, per-project storage, workflow/task surfaces | `cli_inherit` / `cli_isolated` / `direct_api` runtime modes and role defaults | 执行拓扑层 + Provider / Runtime 层 | Borrow runtime choice, not the full app shell |
+| Superpowers / AgentSys pattern | Skills, commands, role discipline, explicit agent operating rules | Role prompt discipline and process-doc compliance checks | 决策核心层 | Borrow reusable discipline, not host-specific command syntax |
+| Task Master pattern | PRD-to-task breakdown, dependencies, next executable task | Checklist dependency/status/next-item visibility inside PlanSession | 决策核心层 + 执行拓扑层 | Borrow task structure, not a second task database |
+| Ralph / Swarm / OpenSwarm patterns | Fresh-session loops, runtime decoupling, structured logs, unified approval signals | Fresh/resume execution guidance, cost/usage placeholders, approval/intervention observability | 执行拓扑层 + Provider / Runtime 层 | Borrow safeguards and observability, not a standalone dashboard |
 | OpenAI `codex-plugin-cc` pattern represented by local plugin docs | Productized `review`, `adversarial-review`, `rescue`, `status`, `result`, `cancel`, `setup` verbs | Standard action taxonomy for team sessions, direct job commands, review/rescue gates | 决策核心层 + 执行拓扑层 | Borrow action grammar and UX, keep local governance-first semantics |
 | Current Agent Orchestrator | Persisted plan sessions, adversarial gap closure, approved-plan execution contract, compliance and evidence reports | Unique product core that reference projects do not replace | 决策核心层 | Keep as differentiator and avoid reducing the project to runtime wrappers |
 
@@ -44,6 +49,8 @@ In scope:
 - Context maps and documentation sync that help agents resume quickly.
 - Packaging and setup diagnostics that honestly report unavailable providers or hooks.
 - Evidence reports that show governance and execution benefits.
+- Governed provider runtime modes: `cli_inherit`, `cli_isolated`, and `direct_api`.
+- Masked API-key readiness for direct API paths without persisting secrets.
 
 Out of scope:
 
@@ -51,6 +58,7 @@ Out of scope:
 - Becoming a standalone plugin marketplace.
 - Making the UI the primary product surface; CLI remains first-class.
 - Pulling broad external dependencies to imitate reference projects.
+- Building a full direct-API tool loop or patch-application engine in this track.
 
 ## Staged Upgrade Track
 
@@ -197,3 +205,179 @@ Pass criteria:
 - Full tests pass.
 - Compliance passes.
 - Working tree only contains intended staged upgrade changes.
+
+## Provider Runtime Isolation Track
+
+This track upgrades Provider / Runtime behavior while preserving the local-first CLI default.
+
+Execution protocol:
+
+- Each stage starts by appending or refreshing its stage note in this document.
+- During a stage, run only the targeted tests listed for that stage.
+- If targeted tests pass, continue into the next stage without waiting for confirmation.
+- Run full `pytest`, `PYTHONPATH=src python -m agent_orchestrator.cli team check-compliance`, and `git status --short` only at final convergence.
+
+Runtime mode contract:
+
+- `cli_inherit`: default mode; reuse the user's local Codex / Claude Code install, auth, config, rules, and project trust behavior.
+- `cli_isolated`: run CLI jobs with a repository-owned runtime home so inherited global rules and shell profile state are visible and bounded.
+- `direct_api`: call provider APIs through environment-provided keys for low-side-effect planning/review/summarization roles; this does not provide a local tool loop.
+
+### Isolation Stage 0: Baseline And Stage Plan Refresh
+
+Goal:
+
+- Record this runtime-mode plan and expand the reference matrix before code changes.
+
+Targeted test:
+
+- `pytest tests/test_docs_process.py tests/test_command.py -q`
+
+### Isolation Stage 1: Provider Runtime Mode Contract
+
+Goal:
+
+- Add runtime-mode fields to agent profiles, job requests, job metadata, and readiness output while keeping default CLI behavior unchanged.
+
+Targeted test:
+
+- `pytest tests/test_command.py tests/test_jobs.py tests/test_cli.py -q`
+
+### Isolation Stage 2: CLI Environment Isolation
+
+Goal:
+
+- Implement `cli_isolated` by creating per-job runtime homes and recording effective environment metadata.
+
+Targeted test:
+
+- `pytest tests/test_command.py tests/test_jobs.py tests/test_team.py -q`
+
+### Isolation Stage 3: Direct API Runtime Foundation
+
+Goal:
+
+- Add a fakeable direct API runtime path with masked API-key readiness and no secret persistence.
+
+Targeted test:
+
+- `pytest tests/test_command.py tests/test_jobs.py tests/test_planning_support.py -q`
+
+### Isolation Stage 4: Policy Routing And Role Defaults
+
+Goal:
+
+- Prefer direct API for low-side-effect governance roles and keep CLI as the default implementation/rescue worker.
+
+Targeted test:
+
+- `pytest tests/test_planning_support.py tests/test_team.py tests/test_cli_presenters.py tests/test_cli.py -q`
+
+### Isolation Stage 5: Reference-Informed Workflow Upgrades
+
+Goal:
+
+- Add task dependency/next-item visibility, role prompt discipline, fresh/resume guidance, and approval/cost observability without adding a second product surface.
+
+Targeted test:
+
+- `pytest tests/test_planning_support.py tests/test_docs_process.py tests/test_evidence.py tests/test_ui_service.py -q`
+
+### Isolation Stage 6: Documentation, Evidence, And Operator Surfaces
+
+Goal:
+
+- Document runtime modes and expose readiness/evidence/operator signals for CLI inheritance, CLI isolation, direct API auth, and provider fallback.
+
+Targeted test:
+
+- `pytest tests/test_docs_process.py tests/test_evidence.py tests/test_cli.py tests/test_cli_presenters.py -q`
+
+## Reference-Informed Product Upgrade Track
+
+This track turns the reference-project lessons into product capabilities while keeping Agent Orchestrator centered on planning governance, execution strategy, and provider/runtime boundaries.
+
+Execution protocol:
+
+- Each stage starts by refreshing this stage plan.
+- During a stage, run only the targeted tests listed for that stage.
+- If targeted tests pass, continue into the next stage without waiting for confirmation.
+- Run full `pytest`, `PYTHONPATH=src python -m agent_orchestrator.cli team check-compliance`, and `git status --short` only at final convergence.
+
+Reference landing zones:
+
+- Task Master: task dependency visibility and next executable work inside PlanSession/WorkGraph, not a second task database.
+- Superpowers / AgentSys: role contracts, command discipline, and compliance-visible role boundaries.
+- Ralph: fresh/resume execution context policy and stop conditions around implementation/review/rescue loops.
+- wanman / slark: local runtime/workspace policy, lightweight threads, and knowledge artifacts without SQLite or a supervisor.
+- OpenSwarm / Claude Swarm: approval, intervention, usage/cost placeholders, and observability, not a mission-control clone.
+
+### Reference Stage 0: Baseline Repair And Plan Refresh
+
+Goal:
+
+- Make tests acknowledge the current `intake_chat -> draft-ready -> submit-review -> approve -> execute` workflow.
+
+Targeted test:
+
+- `pytest tests/test_actions.py tests/test_cli.py tests/test_team.py tests/test_work_graph.py tests/test_evidence.py tests/test_orchestrator.py -q`
+
+### Reference Stage 1: Task Pool And Next Executable Work
+
+Goal:
+
+- Add task dependency, blocked reason, validation, and next executable task surfaces through existing PlanSession/WorkGraph storage.
+
+Targeted test:
+
+- `pytest tests/test_work_graph.py tests/test_team.py tests/test_cli.py -q`
+
+### Reference Stage 2: Role Contracts And Skill Discipline
+
+Goal:
+
+- Add role contract display and compliance checks for role discipline and command validity.
+
+Targeted test:
+
+- `pytest tests/test_actions.py tests/test_planning_support.py tests/test_docs_process.py tests/test_cli.py -q`
+
+### Reference Stage 3: Fresh/Resume Execution Policy
+
+Goal:
+
+- Record fresh/resume execution context policy in team execution, worker/rescue jobs, runbook, and evidence.
+
+Targeted test:
+
+- `pytest tests/test_jobs.py tests/test_command.py tests/test_team.py tests/test_cli_presenters.py -q`
+
+### Reference Stage 4: Knowledge Artifacts And Threaded Handoffs
+
+Goal:
+
+- Persist lightweight decisions, lessons, and workflow notes as JSONL artifacts and expose message thread visibility.
+
+Targeted test:
+
+- `pytest tests/test_messages.py tests/test_memory.py tests/test_team.py tests/test_ui_service.py -q`
+
+### Reference Stage 5: Approval / Observability / Evidence
+
+Goal:
+
+- Surface unified approval state, human intervention reason, job/runtime health, and usage/cost placeholders.
+
+Targeted test:
+
+- `pytest tests/test_evidence.py tests/test_ui_service.py tests/test_ui_server.py tests/test_cli.py -q`
+
+### Reference Stage 6: Documentation And Operator Workflow
+
+Goal:
+
+- Synchronize README, runbook, architecture docs, context map, and refresh/compliance behavior with the reference-informed capabilities.
+
+Targeted test:
+
+- `pytest tests/test_docs_process.py tests/test_planning_support.py tests/test_cli.py -q`

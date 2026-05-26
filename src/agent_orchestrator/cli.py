@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 from agent_orchestrator.adapters import RuntimeProviderAdapter, RuntimeProviderReviewRescueAdapter
+from agent_orchestrator.agent_config import AgentConfigStore
 from agent_orchestrator.cli_common import FORMAT_CHOICES, emit_json as _emit_json, json_only as _json_only
 from agent_orchestrator.cli_evidence import run_evidence_command
 from agent_orchestrator.cli_jobs import run_job_command
@@ -30,7 +31,7 @@ from agent_orchestrator.cli_presenters import (
     team_next_alternatives as _team_next_alternatives,
     team_display_context as _team_display_context,
 )
-from agent_orchestrator.command import CommandJobRuntime, ProviderHealthCheck
+from agent_orchestrator.command import CommandJobRuntime, ProviderHealthCheck, RuntimeModeRouter, direct_api_auth_status
 from agent_orchestrator.orchestrator import Orchestrator
 from agent_orchestrator.policies import OrchestrationMode
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator, build_operator_runbook
@@ -269,6 +270,28 @@ def main() -> None:
     team_retry_adversarial_review.add_argument("--runtime", choices=["mock", "command"], default="mock")
     team_retry_adversarial_review.add_argument("--provider", choices=["codex", "claude"])
 
+    team_chat = team_subparsers.add_parser("chat", help="Send a planning note to the lead agent.")
+    team_chat.add_argument("session_id")
+    team_chat.add_argument("--message", required=True)
+    team_chat.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_chat.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_chat.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_chat.add_argument("--provider", choices=["codex", "claude"])
+
+    team_draft_ready = team_subparsers.add_parser("draft-ready", help="Confirm the first draft is ready for review.")
+    team_draft_ready.add_argument("session_id")
+    team_draft_ready.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_draft_ready.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_draft_ready.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_draft_ready.add_argument("--provider", choices=["codex", "claude"])
+
+    team_submit_review = team_subparsers.add_parser("submit-review", help="Submit the confirmed draft to adversarial review.")
+    team_submit_review.add_argument("session_id")
+    team_submit_review.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_submit_review.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_submit_review.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_submit_review.add_argument("--provider", choices=["codex", "claude"])
+
     team_resume = team_subparsers.add_parser("resume", help="Resume a plan session.")
     team_resume.add_argument("session_id")
     team_resume.add_argument("--apply", action="store_true", help="Apply the recommended resume action when it is safe to do so.")
@@ -437,6 +460,15 @@ def main() -> None:
         if args.team_command == "retry-adversarial-review":
             print(json.dumps(team.retry_adversarial_review(args.session_id).to_dict(), ensure_ascii=False, indent=2))
             return
+        if args.team_command == "chat":
+            print(json.dumps(team.chat_with_lead(args.session_id, message=args.message).to_dict(), ensure_ascii=False, indent=2))
+            return
+        if args.team_command == "draft-ready":
+            print(json.dumps(team.mark_draft_ready(args.session_id).to_dict(), ensure_ascii=False, indent=2))
+            return
+        if args.team_command == "submit-review":
+            print(json.dumps(team.submit_draft_for_review(args.session_id).to_dict(), ensure_ascii=False, indent=2))
+            return
         if args.team_command == "resume":
             print(json.dumps(team.resume(args.session_id, apply=getattr(args, "apply", False)).to_dict(), ensure_ascii=False, indent=2))
             return
@@ -562,21 +594,24 @@ def main() -> None:
 
 
 def _build_orchestrator(runtime: str, provider: str | None) -> Orchestrator:
+    agent_config = AgentConfigStore().read()
     if runtime == "mock":
         return Orchestrator()
 
-    command_runtime = CommandJobRuntime()
-    worker_default_provider = provider or "codex"
-    reviewer_default_provider = provider or "claude"
+    command_runtime = RuntimeModeRouter()
+    worker_default_provider = provider or agent_config.profile("worker").provider
+    reviewer_default_provider = provider or agent_config.profile("execution_reviewer").provider
     return Orchestrator(
         worker=RuntimeProviderAdapter(
             runtime=command_runtime,
             default_provider=worker_default_provider,
             kind="implementation",
+            agent_config=agent_config,
         ),
         reviewer=RuntimeProviderReviewRescueAdapter(
             runtime=command_runtime,
             default_provider=reviewer_default_provider,
+            agent_config=agent_config,
         )
     )
 
@@ -597,6 +632,7 @@ def _build_team_orchestrator(runtime: str, provider: str | None, plans_root: str
         orchestrator=orchestrator,
         store=PlanStore(root=plans_path),
         project_root=project_root,
+        agent_config=AgentConfigStore().read(),
     )
 
 
@@ -655,8 +691,36 @@ def _provider_health_snapshot(*, refresh: bool = False, ttl_seconds: int = 60) -
             "ttl_seconds": ttl_seconds,
             "path": ".agent_orchestrator/cache/provider-health.json",
         },
+        "runtime_modes": _runtime_mode_contract(),
+        "direct_api_auth": [
+            direct_api_auth_status("codex"),
+            direct_api_auth_status("claude"),
+        ],
         "providers": providers,
     }
+
+
+def _runtime_mode_contract() -> list[dict[str, object]]:
+    return [
+        {
+            "mode": "cli_inherit",
+            "default": True,
+            "inherits_user_config": True,
+            "description": "Use local CLI auth, global config, project config, and provider-native rules.",
+        },
+        {
+            "mode": "cli_isolated",
+            "default": False,
+            "inherits_user_config": False,
+            "description": "Run CLI jobs with a repository-owned runtime home and auditable environment metadata.",
+        },
+        {
+            "mode": "direct_api",
+            "default": False,
+            "inherits_user_config": False,
+            "description": "Use API-key-backed single-turn calls for low-side-effect governance work; no local tool loop.",
+        },
+    ]
 
 
 def _install_git_hooks(repo_root: Path) -> None:
@@ -798,9 +862,13 @@ def _team_setup_snapshot(team: TeamOrchestrator, args: argparse.Namespace) -> di
     health_snapshot = _provider_health_snapshot(refresh=args.runtime == "command")
     doc_sync = team.refresh_documentation_sync()
     compliance = team.check_compliance()
-    readiness = _build_setup_readiness(project_root, health_snapshot, doc_sync, compliance)
+    agent_config = AgentConfigStore().read()
+    role_profiles = _role_profile_snapshot(agent_config)
+    readiness = _build_setup_readiness(project_root, health_snapshot, doc_sync, compliance, role_profiles=role_profiles)
     return {
         "provider_health": health_snapshot,
+        "runtime_modes": _runtime_mode_contract(),
+        "role_profiles": role_profiles,
         "doc_sync": doc_sync,
         "compliance": compliance,
         "readiness": readiness,
@@ -818,6 +886,7 @@ def _print_team_setup_summary(payload: dict[str, object]) -> None:
     release = payload.get("release_readiness", {}) if isinstance(payload.get("release_readiness"), dict) else {}
     compliance = readiness.get("compliance_status", {}) if isinstance(readiness.get("compliance_status"), dict) else {}
     provider_states = readiness.get("provider_states", []) if isinstance(readiness.get("provider_states"), list) else []
+    role_profiles = payload.get("role_profiles", []) if isinstance(payload.get("role_profiles"), list) else []
     checklist = release.get("checklist", {}) if isinstance(release.get("checklist"), dict) else {}
     available = [str(item.get("provider")) for item in provider_states if isinstance(item, dict) and item.get("available")]
     unavailable = [
@@ -832,6 +901,9 @@ def _print_team_setup_summary(payload: dict[str, object]) -> None:
         f"compliance={'blocked' if compliance.get('blocking') else 'ok'}"
     )
     print(f"providers: available={','.join(available) if available else 'none'} unavailable={','.join(unavailable) if unavailable else 'none'}")
+    if role_profiles:
+        modes = sorted({str(item.get("runtime_mode")) for item in role_profiles if isinstance(item, dict)})
+        print(f"runtime_modes: {','.join(modes)}")
     if checklist:
         checklist_text = ", ".join(
             f"{key}={'ok' if value else 'missing'}"
@@ -906,6 +978,8 @@ def _build_setup_readiness(
     health_snapshot: dict[str, object],
     doc_sync: dict[str, object],
     compliance: dict[str, object],
+    *,
+    role_profiles: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     providers = health_snapshot.get("providers", []) if isinstance(health_snapshot.get("providers"), list) else []
     provider_states = []
@@ -928,6 +1002,8 @@ def _build_setup_readiness(
         "project_root": str(project_root),
         "ready": ready,
         "provider_states": provider_states,
+        "runtime_mode_states": _runtime_mode_contract(),
+        "role_profiles": role_profiles or [],
         "doc_sync_status": {
             "missing_docs": list(doc_sync.get("missing_docs", [])) if isinstance(doc_sync.get("missing_docs"), list) else [],
             "stale_docs": list(doc_sync.get("stale_docs", [])) if isinstance(doc_sync.get("stale_docs"), list) else [],
@@ -941,6 +1017,23 @@ def _build_setup_readiness(
             "recommended_commands": list(compliance.get("recommended_commands", [])) if isinstance(compliance.get("recommended_commands"), list) else [],
         },
     }
+
+
+def _role_profile_snapshot(agent_config: object) -> list[dict[str, object]]:
+    profiles = getattr(agent_config, "profiles", {})
+    if not isinstance(profiles, dict):
+        return []
+    return [
+        {
+            "role": role,
+            "provider": profile.provider,
+            "model": profile.model,
+            "runtime_mode": profile.runtime_mode,
+            "sandbox": profile.sandbox,
+            "enabled": profile.enabled,
+        }
+        for role, profile in sorted(profiles.items())
+    ]
 
 
 def _build_team_next_command(
@@ -977,6 +1070,21 @@ def _build_team_next_command(
         return (
             "python -m agent_orchestrator.cli team revise "
             f"{session_id} --summary \"close required gaps\" --plans-root {plans_root} --runs-root {runs_root}"
+        )
+    if primary_action == "mark_draft_ready":
+        return (
+            "python -m agent_orchestrator.cli team draft-ready "
+            f"{session_id} --plans-root {plans_root} --runs-root {runs_root}"
+        )
+    if primary_action == "submit_review":
+        return (
+            "python -m agent_orchestrator.cli team submit-review "
+            f"{session_id} --plans-root {plans_root} --runs-root {runs_root}"
+        )
+    if primary_action == "lead_chat":
+        return (
+            "python -m agent_orchestrator.cli team chat "
+            f"{session_id} --message \"clarify the plan\" --plans-root {plans_root} --runs-root {runs_root}"
         )
     if primary_action == "approve":
         return (

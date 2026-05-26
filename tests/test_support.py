@@ -56,3 +56,24 @@ def write_minimal_process_docs(root: Path) -> None:
         project_root=root,
     )
     team.refresh_documentation_sync()
+
+
+def start_reviewed_session(team: TeamOrchestrator, requirement: str, **start_kwargs):
+    session = team.start(requirement, **start_kwargs)
+    session = team.mark_draft_ready(session.id)
+    return team.submit_draft_for_review(session.id)
+
+
+def start_approved_session(team: TeamOrchestrator, requirement: str, **start_kwargs):
+    session = start_reviewed_session(team, requirement, **start_kwargs)
+    required_open = [gap.id for gap in session.gaps if gap.required and gap.status != "closed"]
+    if required_open:
+        session = team.revise(session.id, summary="Close required test gaps", closed_gap_ids=required_open)
+    if session.status != "approved_for_execution":
+        session = team.approve(session.id)
+    return session
+
+
+def start_executed_session(team: TeamOrchestrator, requirement: str, mode=None, **start_kwargs):
+    session = start_approved_session(team, requirement, **start_kwargs)
+    return team.execute(session.id, mode)

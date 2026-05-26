@@ -4,6 +4,7 @@ from dataclasses import replace
 import pytest
 
 from agent_orchestrator.jobs import FileJobRuntime, InMemoryJobRuntime, JobRequest
+from agent_orchestrator.guards import validate_artifact_write
 
 
 def test_in_memory_job_runtime_lifecycle_for_running_job() -> None:
@@ -171,7 +172,56 @@ def test_job_request_defaults_sandbox_by_kind() -> None:
     )
 
     assert review.resolved_sandbox == "read-only"
+    assert review.runtime_mode == "cli_inherit"
     assert rescue.resolved_sandbox == "workspace-write"
+
+
+def test_job_request_and_persisted_job_record_runtime_mode(tmp_path) -> None:
+    runtime = FileJobRuntime(tmp_path)
+    job = runtime.start(
+        JobRequest(
+            task_id="work-runtime-mode",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement this",
+            cwd="/tmp/project",
+            runtime_mode="cli_isolated",
+        )
+    )
+
+    stored = json.loads((tmp_path / f"{job.id}.json").read_text(encoding="utf-8"))
+    assert job.runtime_mode == "cli_isolated"
+    assert stored["runtime_mode"] == "cli_isolated"
+
+
+def test_read_only_job_kinds_reject_writable_sandbox() -> None:
+    for kind in ("research", "review", "adversarial_review"):
+        with pytest.raises(ValueError, match="must use sandbox=read-only"):
+            JobRequest(
+                task_id=f"work-{kind}",
+                provider="claude",
+                kind=kind,  # type: ignore[arg-type]
+                prompt="Read only",
+                cwd="/tmp/project",
+                sandbox="workspace-write",
+            )
+
+
+def test_role_guard_rejects_review_agent_implementation_job() -> None:
+    with pytest.raises(ValueError, match="role reviewer cannot create implementation jobs"):
+        JobRequest(
+            task_id="work-reviewer-impl",
+            provider="claude",
+            kind="implementation",
+            prompt="Implement this",
+            cwd="/tmp/project",
+            metadata={"role": "reviewer"},
+        )
+
+
+def test_role_guard_rejects_builder_approval_artifact_write() -> None:
+    with pytest.raises(ValueError, match="role builder cannot write approved_plan artifacts"):
+        validate_artifact_write("builder", "approved_plan")
 
 
 def test_rescue_requires_failure_reason() -> None:

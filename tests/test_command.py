@@ -6,9 +6,12 @@ from agent_orchestrator.command import (
     CodexCliAdapter,
     CommandJobRuntime,
     CommandResult,
+    DirectApiJobRuntime,
     PromptRenderer,
     ProviderHealthCheck,
+    RuntimeModeRouter,
     _MEMORY_PROVIDER_HEALTH_CACHE,
+    direct_api_auth_status,
 )
 from agent_orchestrator.jobs import JobRequest
 
@@ -17,9 +20,11 @@ class FakeRunner:
     def __init__(self, result: CommandResult) -> None:
         self.result = result
         self.commands: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
 
     def run(self, command: list[str], *, cwd: str, env: dict[str, str] | None = None) -> CommandResult:
         self.commands.append(command)
+        self.envs.append(env)
         return self.result
 
 
@@ -133,6 +138,7 @@ class SessionRunner(FakeRunner):
 
     def spawn(self, command: list[str], *, cwd: str, env: dict[str, str] | None = None) -> FakeSession:
         self.commands.append(command)
+        self.envs.append(env)
         return self.session
 
 
@@ -195,6 +201,9 @@ def test_command_job_runtime_completes_on_zero_exit(tmp_path) -> None:
 
     completed = runtime.status(job.id)
     assert completed.status == "completed"
+    assert completed.runtime_mode == "cli_inherit"
+    assert completed.metadata["runtime_mode"]["mode"] == "cli_inherit"
+    assert completed.metadata["runtime_mode"]["inherits_user_config"] is True
     assert completed.exit_code == 0
     assert completed.raw_output == "ok"
     assert completed.stdout == "ok"
@@ -529,6 +538,29 @@ def test_codex_adapter_generates_command_spec() -> None:
     assert spec.command[:6] == ["codex", "exec", "--model", "gpt-test", "--sandbox", "workspace-write"]
 
 
+def test_command_job_runtime_records_runtime_mode_metadata(tmp_path) -> None:
+    runner = SessionRunner(CommandResult(command=["fake"], exit_code=0, stdout="ok", stderr=""))
+    runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": CodexCliAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-runtime-mode",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+            runtime_mode="cli_isolated",
+        )
+    )
+
+    assert job.runtime_mode == "cli_isolated"
+    assert job.metadata["runtime_mode"]["mode"] == "cli_isolated"
+    assert job.metadata["runtime_mode"]["inherits_user_config"] is False
+    assert job.metadata["runtime_mode"]["project_cwd"] == str(tmp_path)
+    assert job.metadata["runtime_mode"]["runtime_home"].endswith(f"runtime-homes/{job.id}")
+    assert runner.envs[0]["HOME"] == job.metadata["runtime_mode"]["runtime_home"]
+
+
 def test_prompt_renderer_includes_required_sections() -> None:
     prompt = PromptRenderer().render(
         JobRequest(
@@ -551,3 +583,91 @@ def test_prompt_renderer_includes_required_sections() -> None:
     assert "Context\nContext here" in prompt
     assert "Acceptance Criteria" in prompt
     assert "Return Format" in prompt
+
+
+class FakeDirectApiClient:
+    def complete(self, request: JobRequest) -> dict[str, object]:
+        return {
+            "summary": f"fake direct {request.provider}",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "source": "fake"},
+        }
+
+
+def test_direct_api_runtime_reports_auth_required_without_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    runtime = DirectApiJobRuntime(root=tmp_path, client=FakeDirectApiClient())
+
+    job = runtime.start(
+        JobRequest(
+            task_id="direct-missing-auth",
+            provider="codex",
+            kind="review",
+            prompt="Review",
+            cwd=str(tmp_path),
+            runtime_mode="direct_api",
+        )
+    )
+
+    assert job.status == "failed"
+    assert job.error == "auth_required"
+    assert job.metadata["direct_api_auth"]["status"] == "auth_required"
+    assert "OPENAI_API_KEY" in json.dumps(job.to_dict())
+    assert "sk-" not in json.dumps(job.to_dict())
+
+
+def test_direct_api_runtime_completes_with_masked_auth_and_usage(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-value")
+    runtime = DirectApiJobRuntime(root=tmp_path, client=FakeDirectApiClient())
+
+    job = runtime.start(
+        JobRequest(
+            task_id="direct-auth",
+            provider="codex",
+            kind="review",
+            prompt="Review",
+            cwd=str(tmp_path),
+            runtime_mode="direct_api",
+            model="gpt-test",
+        )
+    )
+
+    assert job.status == "completed"
+    assert job.runtime_mode == "direct_api"
+    assert job.metadata["direct_api_auth"]["masked"] == "sk-...alue"
+    assert job.parsed_payload["usage"]["source"] == "fake"
+    assert "sk-test-secret-value" not in json.dumps(job.to_dict())
+
+
+def test_direct_api_auth_status_masks_keys(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret-value")
+    status = direct_api_auth_status("claude")
+
+    assert status["available"] is True
+    assert status["key_name"] == "ANTHROPIC_API_KEY"
+    assert status["masked"] == "ant...alue"
+
+
+def test_runtime_mode_router_sends_direct_api_jobs_to_direct_runtime(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-router-secret")
+    cli_runtime = CommandJobRuntime(
+        root=tmp_path / "cli",
+        runner=SessionRunner(CommandResult(command=["fake"], exit_code=0, stdout="cli", stderr="")),
+        adapters={"codex": CodexCliAdapter()},
+    )
+    direct_runtime = DirectApiJobRuntime(root=tmp_path / "direct", client=FakeDirectApiClient())
+    runtime = RuntimeModeRouter(cli_runtime=cli_runtime, direct_api_runtime=direct_runtime)
+
+    job = runtime.start(
+        JobRequest(
+            task_id="router-direct",
+            provider="codex",
+            kind="review",
+            prompt="Review",
+            cwd=str(tmp_path),
+            runtime_mode="direct_api",
+        )
+    )
+
+    assert runtime.status(job.id).status == "completed"
+    assert job.id in runtime._routes  # noqa: SLF001
+    assert cli_runtime.runner.commands == []

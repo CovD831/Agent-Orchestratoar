@@ -50,6 +50,8 @@ def test_team_start_writes_review_messages_and_job_metadata(tmp_path) -> None:
     )
 
     session = team.start("Build a persisted plan artifact")
+    session = team.mark_draft_ready(session.id)
+    session = team.submit_draft_for_review(session.id)
     store = MessageStore(tmp_path / "messages")
     messages = store.list_for_session(session.id)
     review_requests = [message for message in messages if message["message_type"] == "review_request"]

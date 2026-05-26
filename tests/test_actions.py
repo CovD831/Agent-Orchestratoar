@@ -3,6 +3,7 @@ import pytest
 from agent_orchestrator.actions import assert_session_action_allowed, build_session_actions, primary_action_from_registry
 from agent_orchestrator import Orchestrator
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator
+from test_support import start_approved_session, start_executed_session
 
 
 def _session_payload(tmp_path, requirement: str = "Build a persisted plan artifact") -> dict[str, object]:
@@ -11,7 +12,7 @@ def _session_payload(tmp_path, requirement: str = "Build a persisted plan artifa
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    return team.start(requirement).to_dict()
+    return start_approved_session(team, requirement).to_dict()
 
 
 def test_action_registry_exposes_execute_for_approved_session(tmp_path) -> None:
@@ -51,8 +52,7 @@ def test_action_registry_maps_completed_session_to_inspect_execution(tmp_path) -
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
-    executed = team.execute(session.id)
+    executed = start_executed_session(team, "Build a persisted plan artifact")
 
     actions = {action["id"]: action for action in build_session_actions(executed.to_dict())}
     primary = primary_action_from_registry(executed.to_dict())

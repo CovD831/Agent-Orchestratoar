@@ -6,6 +6,8 @@ const state = {
   globalStream: null,
   sessionStream: null,
   streamRefreshTimer: null,
+  agentConfig: null,
+  selectedAgentRole: "planner",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -80,6 +82,9 @@ function renderSession(payload) {
 
 function actionButtons(action) {
   const map = {
+    lead_chat: "继续沟通",
+    mark_draft_ready: "确认初稿",
+    submit_review: "提交审查",
     approve: "批准计划",
     execute: "开始执行",
     retry_review: "重试审核",
@@ -105,6 +110,13 @@ async function runAction(action) {
   const base = `/api/sessions/${state.selectedSessionId}`;
   if (action === "approve") await api(`${base}/approve`, { method: "POST" });
   else if (action === "execute") await api(`${base}/execute`, { method: "POST", body: JSON.stringify({ mode: "success_first" }) });
+  else if (action === "mark_draft_ready") await api(`${base}/draft-ready`, { method: "POST" });
+  else if (action === "submit_review") await api(`${base}/submit-review`, { method: "POST" });
+  else if (action === "lead_chat") {
+    const message = window.prompt("发给计划主控的消息");
+    if (!message) return;
+    await api(`${base}/chat`, { method: "POST", body: JSON.stringify({ message }) });
+  }
   else if (action === "retry_review") await api(`${base}/retry-review`, { method: "POST" });
   else if (action === "retry_adversarial_review") await api(`${base}/retry-adversarial-review`, { method: "POST" });
   else if (action === "revise") {
@@ -119,6 +131,7 @@ async function runAction(action) {
 function renderAgentCard(card) {
   const status = String(card.status || "unknown");
   const provider = String(card.provider || "agent");
+  const model = card.model ? ` · ${card.model}` : "";
   const kind = String(card.role_label || card.kind || "work");
   const initials = provider.slice(0, 1).toUpperCase();
   return `
@@ -127,7 +140,7 @@ function renderAgentCard(card) {
         <div class="agent-avatar">${escapeHtml(initials)}</div>
         <div class="agent-title">
           <strong>${escapeHtml(kind)}</strong>
-          <span class="summary">${escapeHtml(providerLabel(provider))} · ${escapeHtml(kindLabel(card.kind))}</span>
+          <span class="summary">${escapeHtml(providerLabel(provider))}${escapeHtml(model)} · ${escapeHtml(kindLabel(card.kind))}</span>
         </div>
       </div>
       <div class="agent-task">${escapeHtml(card.current_action || card.summary || card.error || "暂无活动摘要")}</div>
@@ -221,7 +234,7 @@ function renderJobs(payload) {
   const jobs = payload.jobs || [];
   $("jobs").innerHTML = jobs.length
     ? jobs.map((job) => `
-      <button class="job-item" data-job="${job.id}">
+      <button class="job-item ${job.id === state.selectedJobId ? "active" : ""}" data-job="${job.id}">
         <div class="card-head"><strong>${escapeHtml(job.provider)} · ${escapeHtml(job.kind)}</strong>${badge(job.status)}</div>
         <span class="summary">${escapeHtml(job.output_preview || job.summary || job.id)}</span>
         <span class="summary">pid:${escapeHtml(job.pid || "-")} · exit:${escapeHtml(job.exit_code ?? "-")} · ${job.terminal_ref ? escapeHtml(job.terminal_ref) : job.log_available ? "有日志" : "无日志"}</span>
@@ -250,6 +263,7 @@ async function selectJob(id) {
   ]);
   $("log-title").textContent = `任务日志 · ${id}`;
   $("log").textContent = payload.log || "这个任务暂无日志。";
+  $("log").scrollTop = $("log").scrollHeight;
   $("job-actions").innerHTML = `
     <button data-job-command="send" ${isTerminalJob(detail) ? "" : "disabled"}>发送</button>
     <button data-job-command="cancel" ${isTerminalJob(detail) ? "" : "disabled"}>取消</button>
@@ -257,6 +271,9 @@ async function selectJob(id) {
     <span class="summary">${escapeHtml(operationLabel(detail.operation))}</span>
   `;
   bindJobCommands();
+  document.querySelectorAll("[data-job]").forEach((node) => {
+    node.classList.toggle("active", node.dataset.job === id);
+  });
 }
 
 async function refreshSessions(autoselect = true) {
@@ -269,6 +286,68 @@ async function refreshSessions(autoselect = true) {
 
 async function refreshJobs() {
   renderJobs(await api("/api/jobs"));
+}
+
+async function refreshAgentConfig() {
+  if (!$("agent-config")) return;
+  state.agentConfig = await api("/api/agent-config");
+  renderAgentConfig();
+}
+
+function renderAgentConfig() {
+  if (!$("agent-config")) return;
+  const profiles = state.agentConfig?.profiles || {};
+  const roles = Object.keys(profiles);
+  const selected = profiles[state.selectedAgentRole] || profiles[roles[0]] || {};
+  if (!profiles[state.selectedAgentRole] && roles[0]) state.selectedAgentRole = roles[0];
+  $("agent-config").innerHTML = `
+    <label class="field">
+      <span>角色</span>
+      <select id="agent-role">
+        ${roles.map((role) => `<option value="${escapeHtml(role)}" ${role === state.selectedAgentRole ? "selected" : ""}>${escapeHtml(agentRoleLabel(role))}</option>`).join("")}
+      </select>
+    </label>
+    <div class="agent-config-grid">
+      <label class="field">
+        <span>Provider</span>
+        <select id="agent-provider">
+          ${["codex", "claude", "mock"].map((provider) => `<option value="${provider}" ${provider === selected.provider ? "selected" : ""}>${providerLabel(provider)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="field">
+        <span>Model</span>
+        <input id="agent-model" value="${escapeHtml(selected.model || "")}" placeholder="sonnet / opus / gpt-5.4" />
+      </label>
+    </div>
+    <label class="field">
+      <span>Prompt Template</span>
+      <textarea id="agent-prompt" rows="4">${escapeHtml(selected.prompt_template || "{default_prompt}")}</textarea>
+    </label>
+    <button class="primary" type="submit">保存配置</button>
+  `;
+  $("agent-role").addEventListener("change", () => {
+    state.selectedAgentRole = $("agent-role").value;
+    renderAgentConfig();
+  });
+}
+
+async function saveAgentConfig(event) {
+  event.preventDefault();
+  if (!state.agentConfig?.profiles) return;
+  const role = state.selectedAgentRole;
+  const current = state.agentConfig.profiles[role] || {};
+  state.agentConfig.profiles[role] = {
+    ...current,
+    role,
+    provider: $("agent-provider").value,
+    model: $("agent-model").value.trim() || null,
+    prompt_template: $("agent-prompt").value.trim() || "{default_prompt}",
+  };
+  state.agentConfig = await api("/api/agent-config", {
+    method: "POST",
+    body: JSON.stringify(state.agentConfig),
+  });
+  renderAgentConfig();
 }
 
 function escapeHtml(value) {
@@ -362,6 +441,10 @@ function renderOperatorSummary(summary) {
 function statusLabel(status) {
   const map = {
     idle: "空闲",
+    intake_chat: "沟通中",
+    draft_ready: "初稿已确认",
+    adversarial_review: "对抗审查",
+    awaiting_human_confirmation: "等待确认",
     drafting: "起草中",
     in_review: "审核中",
     needs_revision: "需修订",
@@ -384,6 +467,9 @@ function statusLabel(status) {
 
 function actionLabel(action) {
   const map = {
+    lead_chat: "继续沟通",
+    mark_draft_ready: "确认初稿",
+    submit_review: "提交审查",
     inspect_delegated_job: "查看委派任务",
     inspect_compliance: "查看合规状态",
     revise: "修订计划",
@@ -456,6 +542,20 @@ function providerLabel(provider) {
     mock: "Mock",
   };
   return map[String(provider || "")] || provider || "Agent";
+}
+
+function agentRoleLabel(role) {
+  const map = {
+    planner: "计划主控",
+    plan_reviewer: "计划审核",
+    adversarial_reviewer: "对抗审核",
+    worker: "执行 Agent",
+    execution_reviewer: "执行审核",
+    rescue: "救援 Agent",
+    ideation_proponent: "正方构想",
+    ideation_skeptic: "反方质询",
+  };
+  return map[String(role || "")] || role || "Agent";
 }
 
 function gateLabel(gate) {
@@ -579,7 +679,12 @@ function connectSessionStream(id) {
 $("refresh").addEventListener("click", async () => {
   await refreshSessions();
   await refreshJobs();
+  await refreshAgentConfig();
 });
+
+if ($("agent-config")) {
+  $("agent-config").addEventListener("submit", saveAgentConfig);
+}
 
 $("new-session").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -593,6 +698,7 @@ $("new-session").addEventListener("submit", async (event) => {
 
 refreshSessions();
 refreshJobs();
+refreshAgentConfig();
 connectStreams();
 setInterval(() => {
   refreshSessions(false);

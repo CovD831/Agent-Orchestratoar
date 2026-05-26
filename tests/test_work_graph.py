@@ -2,6 +2,7 @@ from agent_orchestrator import Orchestrator
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator
 from agent_orchestrator.roles import DEFAULT_AGENT_ROLES, role_for_job_kind, role_for_work_unit_kind
 from agent_orchestrator.work_graph import WorkGraphStore, graph_to_plan_tree, node_actions, schedulable_nodes
+from test_support import start_approved_session, start_executed_session, start_reviewed_session
 
 
 def test_agent_role_registry_maps_job_and_work_unit_kinds() -> None:
@@ -18,7 +19,7 @@ def test_team_start_persists_initial_work_graph(tmp_path) -> None:
         project_root=tmp_path,
     )
 
-    session = team.start("Build a persisted plan artifact")
+    session = start_reviewed_session(team, "Build a persisted plan artifact")
     graph = WorkGraphStore(tmp_path / "plans").read(session.id)
 
     assert graph.session_id == session.id
@@ -38,9 +39,7 @@ def test_work_graph_updates_execution_run_node_after_execute(tmp_path) -> None:
     )
     team.orchestrator.run_store.root = tmp_path / "runs"
     team.orchestrator.run_store.__post_init__()
-    session = team.start("Build a persisted plan artifact")
-
-    executed = team.execute(session.id)
+    executed = start_executed_session(team, "Build a persisted plan artifact")
     graph = WorkGraphStore(tmp_path / "plans").read(session.id)
 
     assert executed.resume.linked_execution_run_id
@@ -58,7 +57,7 @@ def test_graph_to_plan_tree_preserves_related_jobs(tmp_path) -> None:
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = start_reviewed_session(team, "Build a persisted plan artifact")
 
     tree = graph_to_plan_tree(WorkGraphStore(tmp_path / "plans").read(session.id))
     review_nodes = [node for node in tree["children"] if node["kind"] in {"review_round", "adversarial_review"}]
@@ -75,7 +74,7 @@ def test_work_graph_exposes_schedulable_nodes_and_node_actions(tmp_path) -> None
         store=PlanStore(root=tmp_path / "plans"),
         project_root=tmp_path,
     )
-    session = team.start("Build a persisted plan artifact")
+    session = start_approved_session(team, "Build a persisted plan artifact")
     graph = WorkGraphStore(tmp_path / "plans").read(session.id)
 
     nodes = schedulable_nodes(graph)

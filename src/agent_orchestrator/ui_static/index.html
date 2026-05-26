@@ -91,7 +91,7 @@
           </section>
         </section>
 
-        <aside class="control">
+        <aside class="control" aria-label="任务检查器">
           <section class="next-action">
             <div>
               <span class="eyebrow">下一步</span>
@@ -107,7 +107,17 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel agent-config-panel">
+            <div class="panel-head">
+              <div>
+                <span class="eyebrow">Agent 配置</span>
+                <h2>模型与 Prompt</h2>
+              </div>
+            </div>
+            <form id="agent-config" class="agent-config-form"></form>
+          </section>
+
+          <section class="panel runbook-panel">
             <div class="panel-head">
               <div>
                 <span class="eyebrow">操作手册</span>

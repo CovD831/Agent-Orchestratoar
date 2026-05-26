@@ -5,6 +5,7 @@
 - context map
 - `actions.py`: Backend action registry for plan session operations.
 - `adapters.py`: Adapter interfaces and deterministic MVP implementations.
+- `agent_config.py`: Configurable agent profiles for provider, model, and prompt selection.
 - `cli.py`: Command line interface for the orchestration MVP.
 - `cli_common.py`: Shared helpers for command-line presenters.
 - `cli_evidence.py`: Evidence command handlers for the Agent Orchestrator CLI.
@@ -14,6 +15,7 @@
 - `events.py`: Append-only event store for orchestration state changes.
 - `evidence.py`: Versioned evidence harness and benchmark reports for team workflow comparisons.
 - `failure.py`: Failure detection and reroute decisions for whole-run upgrades.  This router only supports full-run escalation between modes. It does not attempt partial DAG rollback, branch splitting, or multi-path replay.
+- `guards.py`: Hard permission guards for agent jobs, roles, and plan artifacts.
 - `ideation.py`: Idea discussion and lightweight debate helpers.
 - `jobs.py`: Durable job lifecycle models and runtimes.
 - `memory.py`: Lightweight append-only memory records for orchestration evidence.

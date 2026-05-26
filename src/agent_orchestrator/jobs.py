@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# DEPS: __future__, agent_orchestrator, dataclasses, datetime, json, pathlib, typing, uuid
+# RESPONSIBILITY: Model and persist job requests, lifecycle state, and local job runtimes.
+# MODULE: runtime
+# ---
+
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -9,10 +14,13 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
+from agent_orchestrator.guards import validate_job_request_permissions, validate_runtime_start
+
 Provider = Literal["claude", "codex", "mock"]
 JobKind = Literal["research", "implementation", "review", "adversarial_review", "rescue"]
 JobStatus = Literal["pending", "running", "idle", "completed", "failed", "cancelled"]
 JobPhase = Literal["starting", "working", "reviewing", "done", "failed", "cancelled"]
+RuntimeMode = Literal["cli_inherit", "cli_isolated", "direct_api"]
 ProviderOperationStatus = Literal[
     "accepted",
     "unsupported",
@@ -47,6 +55,7 @@ class JobRequest:
     model: str | None = None
     reasoning_effort: ReasoningEffort = "medium"
     sandbox: SandboxMode | None = None
+    runtime_mode: RuntimeMode = "cli_inherit"
     max_depth: int = 3
     delegation_chain: list[DelegationStep] = field(default_factory=list)
     failure_reason: str | None = None
@@ -59,6 +68,7 @@ class JobRequest:
             raise ValueError("Delegation chain exceeds max_depth.")
         if _is_unjustified_ping_pong(self.delegation_chain, self.provider, self.kind):
             raise ValueError("Unjustified provider ping-pong is not allowed.")
+        validate_job_request_permissions(kind=self.kind, sandbox=self.sandbox, metadata=self.metadata)
 
     @property
     def resolved_sandbox(self) -> SandboxMode:
@@ -80,6 +90,7 @@ class JobRequest:
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "sandbox": self.resolved_sandbox,
+            "runtime_mode": self.runtime_mode,
             "max_depth": self.max_depth,
             "delegation_chain": [list(step) for step in self.delegation_chain],
             "failure_reason": self.failure_reason,
@@ -129,6 +140,7 @@ class AgentJob:
     cwd: str
     sandbox: SandboxMode
     reasoning_effort: ReasoningEffort
+    runtime_mode: RuntimeMode = "cli_inherit"
     model: str | None = None
     session_id: str | None = None
     thread_id: str | None = None
@@ -161,6 +173,7 @@ class AgentJob:
             "cwd": self.cwd,
             "sandbox": self.sandbox,
             "reasoning_effort": self.reasoning_effort,
+            "runtime_mode": self.runtime_mode,
             "model": self.model,
             "session_id": self.session_id,
             "thread_id": self.thread_id,
@@ -195,6 +208,7 @@ class AgentJob:
             cwd=data["cwd"],
             sandbox=data["sandbox"],
             reasoning_effort=data["reasoning_effort"],
+            runtime_mode=data.get("runtime_mode", "cli_inherit"),
             model=data.get("model"),
             session_id=data.get("session_id"),
             thread_id=data.get("thread_id"),
@@ -254,6 +268,7 @@ class InMemoryJobRuntime:
     jobs: dict[str, AgentJob] = field(default_factory=dict)
 
     def start(self, request: JobRequest) -> AgentJob:
+        validate_runtime_start(request)
         now = now_iso()
         job = AgentJob(
             id=new_job_id(),
@@ -266,6 +281,7 @@ class InMemoryJobRuntime:
             cwd=request.cwd,
             sandbox=request.resolved_sandbox,
             reasoning_effort=request.reasoning_effort,
+            runtime_mode=request.runtime_mode,
             model=request.model,
             session_id=f"{request.provider}-session-{uuid4().hex[:8]}",
             thread_id=f"{request.provider}-thread-{uuid4().hex[:8]}",
@@ -397,6 +413,7 @@ class FileJobRuntime:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def start(self, request: JobRequest) -> AgentJob:
+        validate_runtime_start(request)
         now = now_iso()
         job = AgentJob(
             id=new_job_id(),
@@ -409,6 +426,7 @@ class FileJobRuntime:
             cwd=request.cwd,
             sandbox=request.resolved_sandbox,
             reasoning_effort=request.reasoning_effort,
+            runtime_mode=request.runtime_mode,
             model=request.model,
             session_id=f"{request.provider}-session-{uuid4().hex[:8]}",
             thread_id=f"{request.provider}-thread-{uuid4().hex[:8]}",

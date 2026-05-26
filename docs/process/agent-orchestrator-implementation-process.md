@@ -5,7 +5,7 @@
 - Planning Governance Progress: `decision-core-first happy path established; recovery and handoff hardening in progress`
 - Execution Strategy Progress: `iteration 4 in progress`
 - Total Product Progress: `decision-core-first happy path established with planning skeleton advancing`
-- Current Product Gap: the repository now has a basic planning governance loop, persisted plan sessions, dual-model review rounds, decision verdicts, approved-plan-driven execution provenance, execution gating, visible reviewer fallback policy, structured topology rationale, scoped changed-file compliance hooks, operator-runbook signal compliance, and a structured compliance contract with changed-file header enforcement, but still lacks fully hardened recovery semantics, richer topology policy breadth, broader documentation coverage, stronger narrow-scope hook enforcement for the internal-default workflow, and the newly accepted reference-informed v1.x upgrade plan is now the staged backlog for these improvements
+- Current Product Gap: the repository now has a basic planning governance loop, persisted plan sessions, dual-model review rounds, decision verdicts, approved-plan-driven execution provenance, execution gating, visible reviewer fallback policy, structured topology rationale, scoped changed-file compliance hooks, operator-runbook signal compliance, a structured compliance contract with changed-file header enforcement, and explicit Provider / Runtime modes for `cli_inherit`, `cli_isolated`, and `direct_api`, but still lacks fully hardened recovery semantics, richer topology policy breadth, broader documentation coverage, stronger narrow-scope hook enforcement for the internal-default workflow, and deeper direct-API tool-loop support
 
 ## Purpose Of This Document
 
@@ -44,6 +44,7 @@ Update this file at the end of every implementation iteration. Do not maintain a
 
 - `agent team` 默认视为执行拓扑层
 - `claude / codex / command runtime` 默认视为 Provider / Runtime 层
+- `cli_inherit / cli_isolated / direct_api` 默认视为 Provider / Runtime 层
 - `PlanSession / RoundController / gap closure / approved-plan gate` 默认视为决策核心层
 
 执行方式补充：

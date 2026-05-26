@@ -8,6 +8,8 @@ def test_context_map_doc_exists_and_mentions_codebase_map_style_orientation() ->
     assert "root map" in text
     assert "module manifest" in text
     assert "file-header contract" in text
+    assert "cli_inherit" in text
+    assert "direct_api" in text
 
 
 def test_long_cycle_plan_declares_auto_continue_protocol() -> None:
@@ -83,6 +85,9 @@ def test_process_doc_reflects_basic_documentation_gate_progress() -> None:
     assert "operator-runbook signal compliance" in text
     assert "Operator runbook drift for topology and provider fallback signals is now blocked" in text
     assert "Checklist ownership is now explicit on persisted plan items" in text
+    assert "cli_inherit" in text
+    assert "cli_isolated" in text
+    assert "direct_api" in text
     assert "No hook-based compliance checks are active." not in text
 
 

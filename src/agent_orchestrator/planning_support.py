@@ -131,6 +131,8 @@ def canonical_process_documentation_bundle(project_root: Path) -> ProcessDocumen
                 "module manifest",
                 "file-header contract",
                 "compliance checks",
+                "provider runtime modes: cli_inherit, cli_isolated, direct_api",
+                "direct API readiness uses masked env-key reporting only",
                 "README.md",
                 "docs/process/agent-orchestrator-implementation-process.md",
                 "docs/process/agent-team-operator-runbook.md",
@@ -1049,6 +1051,25 @@ def build_session_guidance(session: PlanSession) -> SessionGuidance:
         primary_reason = "execution is in progress; wait for completion or inspect the linked run"
         resume_action = "wait_for_execution"
         resume_reason = "execution_in_progress"
+    elif session.status == "intake_chat":
+        primary_action = "mark_draft_ready"
+        primary_reason = "continue chatting with the planning lead until the first draft is ready"
+        resume_action = "mark_draft_ready"
+        resume_reason = "draft_not_confirmed"
+        recovery_actions = ["lead_chat"]
+    elif session.status == "draft_ready":
+        primary_action = "submit_review"
+        primary_reason = "the first draft is confirmed; submit it to adversarial review"
+        resume_action = "submit_review"
+        resume_reason = "draft_ready_for_review"
+        recovery_actions = ["lead_chat"]
+    elif session.status == "adversarial_review":
+        primary_action = "inspect_delegated_job"
+        primary_reason = "adversarial review is in progress; inspect review jobs before intervening"
+        resume_action = "inspect_delegated_job"
+        resume_reason = "adversarial_review_in_progress"
+        block_source = "review"
+        recovery_actions = ["inspect_delegated_job"]
     elif compliance_blocking_reasons:
         block_source = "compliance"
         primary_action = "inspect_compliance"
@@ -1110,6 +1131,20 @@ def build_session_guidance(session: PlanSession) -> SessionGuidance:
         primary_reason = "all required gaps are closed; approval is now allowed"
         resume_action = "approve"
         resume_reason = "required_gaps_closed"
+    elif session.status == "awaiting_human_confirmation":
+        if required_open:
+            block_source = "review"
+            primary_action = "revise"
+            primary_reason = f"{len(required_open)} required review gap(s) need human supplement before approval"
+            resume_action = "revise"
+            resume_reason = "human_supplement_required"
+            recovery_actions = ["lead_chat", "revise_plan"]
+        else:
+            primary_action = "approve"
+            primary_reason = "adversarial review is complete; human approval is now required before execution"
+            resume_action = "approve"
+            resume_reason = "human_confirmation_required"
+            recovery_actions = ["lead_chat"]
     elif session.status == "approved_for_execution":
         primary_action = "execute"
         primary_reason = "plan is approved; execution is the next valid action"
@@ -1295,12 +1330,16 @@ def _collect_delegated_jobs(session: PlanSession) -> tuple[list[dict[str, object
             job_summary = runtime_status.summary or summary
             job_error = runtime_status.error
             provider = runtime_status.provider
+            model = runtime_status.model
+            metadata = runtime_status.metadata
             if runtime_status.status == "failed" and latest_round_by_family.get(_delegated_round_family(round_.round_type) or "") is round_:
                 delegated_job_failed = True
             if runtime_status.status in {"pending", "running"} and latest_round_by_family.get(_delegated_round_family(round_.round_type) or "") is round_:
                 delegated_job_in_progress = True
         else:
             provider = "claude" if "claude" in summary else "mock"
+            model = None
+            metadata = {}
         if job_status == "failed" and latest_round_by_family.get(_delegated_round_family(round_.round_type) or "") is round_ and delegated_job_provider is None:
             delegated_job_provider = provider
         delegated_jobs.append(
@@ -1311,6 +1350,8 @@ def _collect_delegated_jobs(session: PlanSession) -> tuple[list[dict[str, object
                 "status": job_status,
                 "summary": job_summary,
                 "error": job_error,
+                "model": model,
+                "metadata": metadata,
             }
         )
     return delegated_jobs, delegated_job_failed, delegated_job_in_progress, delegated_job_provider
@@ -1331,10 +1372,11 @@ def _delegated_failure_supports_retry(session: PlanSession, delegated_job_provid
     if not isinstance(recommendation, dict):
         return False
     reviewer = recommendation.get("reviewer")
-    fallback_from = recommendation.get("fallback_from")
+    adversarial_reviewer = recommendation.get("adversarial_reviewer")
+    fallback_from = recommendation.get("fallback_from") or recommendation.get("adversarial_fallback_from")
     return bool(
         delegated_job_provider
-        and reviewer == delegated_job_provider
+        and delegated_job_provider in {reviewer, adversarial_reviewer}
         and fallback_from
         and fallback_from != delegated_job_provider
     )
@@ -1360,6 +1402,12 @@ def _delegated_round_family(round_type: str) -> str | None:
 
 
 def _resume_guidance_command(session_id: str, action: str) -> str:
+    if action == "mark_draft_ready":
+        return f"python -m agent_orchestrator.cli team draft-ready {session_id}"
+    if action == "submit_review":
+        return f"python -m agent_orchestrator.cli team submit-review {session_id}"
+    if action == "lead_chat":
+        return f"python -m agent_orchestrator.cli team chat {session_id} --message \"clarify the plan\""
     if action == "retry_review":
         return f"python -m agent_orchestrator.cli team retry-review {session_id}"
     if action == "retry_adversarial_review":

@@ -43,6 +43,9 @@ class TeamAction:
 
 
 ACTION_LABELS = {
+    "lead_chat": ("继续沟通", "继续和计划主控澄清需求"),
+    "mark_draft_ready": ("确认初稿", "确认第一版计划可以进入审查"),
+    "submit_review": ("提交审查", "让主控和对抗审核开始质疑补全"),
     "revise": ("修订计划", "关闭缺口并提交修订说明"),
     "approve": ("批准执行", "批准已完成修订的计划"),
     "execute": ("开始执行", "从已批准计划启动执行 run"),
@@ -117,6 +120,16 @@ def _allowed_actions_for_status(status: str, primary_action: str, recovery_actio
     allowed: set[str] = set()
     if status == "needs_revision":
         allowed.add("revise")
+    if status == "intake_chat":
+        allowed.update({"lead_chat", "mark_draft_ready"})
+    if status == "draft_ready":
+        allowed.update({"lead_chat", "submit_review"})
+    if status == "awaiting_human_confirmation":
+        allowed.update({"lead_chat"})
+        if primary_action == "approve":
+            allowed.add("approve")
+        else:
+            allowed.add("revise")
     if status == "approved_for_execution":
         allowed.add("execute")
     if status in {"accepted", "needs_followup"}:
@@ -152,6 +165,12 @@ def _command_map(commands: list[str]) -> dict[str, str]:
             mapped["retry_adversarial_review"] = command
         elif "retry-review" in command:
             mapped["retry_review"] = command
+        elif " draft-ready " in f" {command} ":
+            mapped["mark_draft_ready"] = command
+        elif " submit-review " in f" {command} ":
+            mapped["submit_review"] = command
+        elif " chat " in f" {command} ":
+            mapped["lead_chat"] = command
         elif " inspect-execution " in f" {command} ":
             mapped["inspect_execution"] = command
         elif " execute " in f" {command} ":
@@ -168,7 +187,7 @@ def _action_reason(action_id: str, enabled: bool, status: str, summary: dict[str
 
 
 def _risk_level(action_id: str) -> str:
-    if action_id in {"execute", "approve"}:
+    if action_id in {"execute", "approve", "submit_review"}:
         return "medium"
     if action_id in {"retry_review", "retry_adversarial_review", "resume"}:
         return "low"
@@ -186,12 +205,17 @@ def _input_schema(action_id: str) -> dict[str, object]:
         }
     if action_id == "execute":
         return {"required": [], "properties": {"mode": {"type": "string"}}}
+    if action_id == "lead_chat":
+        return {"required": ["message"], "properties": {"message": {"type": "string"}}}
     return {"required": [], "properties": {}}
 
 
 def _state_changes(action_id: str) -> list[str]:
     changes = {
         "revise": ["append revision round", "close selected gaps", "refresh compliance"],
+        "lead_chat": ["append human message", "append lead response"],
+        "mark_draft_ready": ["set status draft_ready"],
+        "submit_review": ["run review rounds", "set status awaiting_human_confirmation"],
         "approve": ["set status approved_for_execution", "build approved plan"],
         "execute": ["set status executing", "create linked run", "finalize execution verdict"],
         "retry_review": ["append review_retry round", "recompute gaps"],
@@ -223,3 +247,5 @@ def _validate_action_payload(action_id: str, payload: dict[str, object]) -> None
             raise ValueError("revise action requires closed_gap_ids")
     if action_id == "execute" and payload.get("mode") is not None and not isinstance(payload.get("mode"), str):
         raise ValueError("execute action mode must be a string")
+    if action_id == "lead_chat" and not str(payload.get("message", "")).strip():
+        raise ValueError("lead_chat action requires message")

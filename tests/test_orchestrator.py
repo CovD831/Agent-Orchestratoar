@@ -4,12 +4,14 @@ from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 
 from agent_orchestrator import ExecutionContract, OrchestrationMode, Orchestrator, PlanStore, TeamOrchestrator, get_policy
+from agent_orchestrator.agent_config import AgentConfig, AgentProfile
 from agent_orchestrator.adapters import RuntimeProviderAdapter, RuntimeProviderReviewRescueAdapter
 from agent_orchestrator.command import ClaudeCodeAdapter, CodexCliAdapter, CommandJobRuntime, CommandResult, ProviderStatus
 from agent_orchestrator.jobs import AgentJob, InMemoryJobRuntime, JobRequest
 from agent_orchestrator.run_store import RunStore
 from agent_orchestrator.routing import PolicyRouter
 from agent_orchestrator.tasks import WorkUnit, WorkUnitResult
+from test_support import start_approved_session
 
 
 class _MixedSession:
@@ -112,6 +114,59 @@ def test_agent_disabled_uses_direct_execution_path() -> None:
     assert run.policy.provider_flow == ()
     assert len(run.work_units) == 1
     assert run.work_units[0].owner_type == "single_worker"
+
+
+def test_runtime_provider_adapter_uses_worker_agent_model_and_prompt() -> None:
+    runtime = InMemoryJobRuntime()
+    config = AgentConfig(
+        profiles={
+            **AgentConfig.defaults().profiles,
+            "worker": AgentProfile(
+                role="worker",
+                provider="claude",
+                model="opus",
+                prompt_template="Worker custom: {default_prompt}",
+            ),
+        }
+    )
+    adapter = RuntimeProviderAdapter(
+        runtime=runtime,
+        kind="implementation",
+        default_provider="codex",
+        agent_config=config,
+    )
+    work_unit = WorkUnit(
+        goal="Implement configurable worker",
+        context="ctx",
+        inputs=[],
+        outputs=[],
+        acceptance_criteria=[],
+        risk_level="low",
+        parallelizable=False,
+        owner_type="single_worker",
+        max_depth=1,
+        failure_policy="retry",
+        id="wu-1",
+    )
+
+    adapter.execute(work_unit, get_policy(OrchestrationMode.SUCCESS_FIRST))
+    job = next(iter(runtime.jobs.values()))
+
+    assert job.provider == "claude"
+    assert job.model == "opus"
+    assert job.prompt == "Worker custom: Implement configurable worker"
+    assert job.runtime_mode == "cli_inherit"
+
+
+def test_agent_config_defaults_use_direct_api_for_governance_roles() -> None:
+    config = AgentConfig.defaults()
+
+    assert config.profile("planner").runtime_mode == "direct_api"
+    assert config.profile("plan_reviewer").runtime_mode == "direct_api"
+    assert config.profile("adversarial_reviewer").runtime_mode == "direct_api"
+    assert config.profile("execution_reviewer").runtime_mode == "direct_api"
+    assert config.profile("worker").runtime_mode == "cli_inherit"
+    assert config.profile("rescue").runtime_mode == "cli_inherit"
 
 
 def test_depth_override_trims_success_first_topology() -> None:
@@ -648,7 +703,7 @@ def test_team_and_direct_run_execution_contracts_share_core_schema(tmp_path) -> 
         orchestrator=Orchestrator(),
         store=PlanStore(root=tmp_path / "plans"),
     )
-    session = team.start("Build a persisted plan artifact")
+    session = start_approved_session(team, "Build a persisted plan artifact")
 
     direct_contract = direct_run.metadata["execution_contract"]
     plan_contract = session.approved_plan["execution_contract"]

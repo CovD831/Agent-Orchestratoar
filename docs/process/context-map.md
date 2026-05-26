@@ -5,6 +5,8 @@
 - module manifest
 - file-header contract
 - compliance checks
+- provider runtime modes: cli_inherit, cli_isolated, direct_api
+- direct API readiness uses masked env-key reporting only
 - README.md
 - docs/process/agent-orchestrator-implementation-process.md
 - docs/process/agent-team-operator-runbook.md

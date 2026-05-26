@@ -33,14 +33,14 @@ def test_dashboard_lists_sessions_and_builds_detail(tmp_path) -> None:
 
     assert sessions[0]["id"] == session["id"]
     assert detail["session"]["id"] == session["id"]
-    assert detail["next_action"]["primary_action"] == "execute"
-    assert detail["next_action"]["primary_label"] == "开始执行"
+    assert detail["next_action"]["primary_action"] == "mark_draft_ready"
+    assert detail["next_action"]["primary_label"] == "确认初稿"
     assert detail["actions"]
-    execute_action = next(action for action in detail["actions"] if action["id"] == "execute")
-    assert execute_action["confirmation_required"] is True
-    assert execute_action["state_changes"]
+    draft_action = next(action for action in detail["actions"] if action["id"] == "mark_draft_ready")
+    assert draft_action["enabled"] is True
+    assert draft_action["state_changes"]
     assert detail["events"]
-    assert detail["messages"]["count"] >= 4
+    assert detail["messages"]["count"] >= 2
     assert detail["evidence_summary"]["memory_record_count"] >= 1
     assert detail["evidence_summary"]["recent_memory"]
     assert "retrieved_memory" in detail["evidence_summary"]
@@ -50,7 +50,7 @@ def test_dashboard_lists_sessions_and_builds_detail(tmp_path) -> None:
     assert detail["agent_cards"][0]["attach_available"] is False
     assert detail["agent_cards"][0]["terminal_ref"] is None
     assert detail["role_groups"]
-    assert detail["governance_summary"]["primary_action"] == "execute"
+    assert detail["governance_summary"]["primary_action"] == "mark_draft_ready"
     assert detail["operator_summary"]["session"]["id"] == session["id"]
     assert detail["operator_summary"]["review_policy"]["policy_name"]
     assert "fallback_snapshot" in detail["operator_summary"]
@@ -126,6 +126,28 @@ def test_dashboard_job_send_cancel_surface_operation_status(tmp_path) -> None:
     assert missing["operation"]["status"] == "session_missing"
 
 
+def test_dashboard_job_terminal_input_and_reconnect_surface_status(tmp_path) -> None:
+    service = _service(tmp_path)
+    runtime = FileJobRuntime(root=tmp_path / "jobs")
+    job = runtime.start(
+        JobRequest(
+            task_id="ui-job-terminal-operation",
+            provider="codex",
+            kind="implementation",
+            prompt="Build UI",
+            cwd=str(tmp_path),
+            metadata={"terminal_ref": "tmux:agent-job", "attach_available": True},
+        )
+    )
+
+    sent = service.send_job_terminal_input(job.id, "continue")
+    snapshot = service.reconnect_job_terminal(job.id)
+
+    assert sent["operation"]["status"] == "accepted"
+    assert snapshot["job_id"] == job.id
+    assert snapshot["terminal_ref"] == "tmux:agent-job"
+
+
 def test_dashboard_job_cards_surface_terminal_metadata(tmp_path) -> None:
     service = _service(tmp_path)
     runtime = FileJobRuntime(root=tmp_path / "jobs")
@@ -146,6 +168,29 @@ def test_dashboard_job_cards_surface_terminal_metadata(tmp_path) -> None:
     assert detail["attach_available"] is True
 
 
+def test_dashboard_job_terminal_snapshot_surfaces_stdout_and_terminal_ref(tmp_path) -> None:
+    service = _service(tmp_path)
+    runtime = FileJobRuntime(root=tmp_path / "jobs")
+    job = runtime.start(
+        JobRequest(
+            task_id="ui-job-terminal",
+            provider="codex",
+            kind="implementation",
+            prompt="Build terminal UI",
+            cwd=str(tmp_path),
+            metadata={"terminal_ref": "tmux:agent-terminal", "attach_available": True},
+        )
+    )
+    runtime.complete(job.id, summary="captured", stdout="pane output")
+
+    snapshot = service.get_job_terminal_snapshot(job.id)
+
+    assert snapshot["job_id"] == job.id
+    assert snapshot["terminal_ref"] == "tmux:agent-terminal"
+    assert snapshot["attach_available"] is True
+    assert snapshot["stdout"] == "pane output"
+
+
 def test_dashboard_service_can_use_tmux_job_runtime(tmp_path) -> None:
     service = build_dashboard_service(
         plans_root=str(tmp_path / "plans"),
@@ -160,6 +205,9 @@ def test_dashboard_service_can_use_tmux_job_runtime(tmp_path) -> None:
 def test_dashboard_actions_execute_and_read_run(tmp_path) -> None:
     service = _service(tmp_path)
     session = service.create_session("Build a persisted plan artifact")
+    session = service.mark_draft_ready(str(session["id"]))
+    session = service.submit_draft_for_review(str(session["id"]))
+    session = service.approve_session(str(session["id"]))
 
     executed = service.execute_session(str(session["id"]), mode=OrchestrationMode.SUCCESS_FIRST.value)
     run_id = executed["resume"]["linked_execution_run_id"]
@@ -230,7 +278,7 @@ def test_dashboard_governance_summary_surfaces_topology_and_recovery(tmp_path) -
 
     assert summary["selected_topology"]
     assert isinstance(summary["selected_provider_runtime"], dict)
-    assert summary["primary_action"] == "execute"
+    assert summary["primary_action"] == "mark_draft_ready"
     assert isinstance(summary["blocking"], bool)
     assert isinstance(summary["recovery_actions"], list)
     assert summary["recovery_action_count"] == len(summary["recovery_actions"])
@@ -252,6 +300,9 @@ def test_dashboard_plan_tree_includes_subtasks_rounds_and_execution(tmp_path) ->
     assert review_nodes
     assert any(node["related_agent_ids"] for node in review_nodes)
 
+    session = service.mark_draft_ready(str(session["id"]))
+    session = service.submit_draft_for_review(str(session["id"]))
+    session = service.approve_session(str(session["id"]))
     executed = service.execute_session(str(session["id"]), mode=OrchestrationMode.SUCCESS_FIRST.value)
     executed_detail = service.get_session(str(executed["id"]))
     executed_children = executed_detail["plan_tree"]["children"]
@@ -283,9 +334,8 @@ def test_dashboard_role_groups_prefer_persisted_work_graph(tmp_path) -> None:
     assert detail["work_graph"]["session_id"] == session["id"]
     assert "schedulable_nodes" in detail["work_graph"]
     assert any(card["role"] == "builder" for card in groups["execution"]["cards"])
-    reviewer_cards = [card for card in groups["review"]["cards"] if card["role"] == "reviewer"]
-    assert reviewer_cards
-    assert reviewer_cards[0]["inbox_count"] >= 1
-    assert reviewer_cards[0]["outbox_count"] >= 1
-    assert reviewer_cards[0]["latest_message_summary"]
+    lead_cards = [card for card in groups["decision"]["cards"] if card["role"] == "lead"]
+    assert lead_cards
+    assert lead_cards[0]["outbox_count"] >= 1
+    assert lead_cards[0]["latest_message_summary"]
     assert any(card["role"] == "runtime" for card in groups["runtime"]["cards"])

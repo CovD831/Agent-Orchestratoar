@@ -1,6 +1,7 @@
 """Adaptive Claude-Codex-Claude orchestration framework."""
 
 from agent_orchestrator.orchestrator import Orchestrator
+from agent_orchestrator.agent_config import AgentConfig, AgentConfigStore, AgentProfile
 from agent_orchestrator.policies import OrchestrationMode, PolicyProfile, get_policy
 from agent_orchestrator.failure import FailureDecision, FailureRouter, FailureSignal
 from agent_orchestrator.tasks import (
@@ -52,6 +53,9 @@ from agent_orchestrator.planning import (
 
 __all__ = [
     "AgentJob",
+    "AgentConfig",
+    "AgentConfigStore",
+    "AgentProfile",
     "ClaudeCodeAdapter",
     "CodexCliAdapter",
     "CommandJobRuntime",
