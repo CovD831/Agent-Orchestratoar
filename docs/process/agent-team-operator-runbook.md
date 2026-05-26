@@ -11,7 +11,7 @@
 默认原则：
 
 - 优先通过 `team` 命令继续推进
-- 优先看 `team summary`、`team next`、`team runbook`
+- 优先看 `team summary`、`team next`、`team runbook`、`team roles`
 - 不要直接编辑底层 JSON
 - 先看 decision core 的裁决，再看执行层细节
 
@@ -26,6 +26,17 @@
 5. `team revise` 或 `team approve`
 6. `team execute`
 7. `team inspect-execution`
+8. `team task list` / `team task next`
+
+## Role Contracts
+
+`team roles` 是角色纪律的标准入口。它展示 planner、reviewer、adversarial_reviewer、builder、rescue 的 runtime mode、allowed actions、forbidden actions、required outputs、command refs。
+
+- planner: `team start`、`team chat`、`team draft-ready`、`team task next`
+- reviewer: `team submit-review`、`team retry-review`、`team task list`
+- adversarial_reviewer: `team submit-review`、`team retry-adversarial-review`
+- builder: `team execute`、`team inspect-execution`
+- rescue: `team inspect-blockers`、`team retry-review`、`team retry-adversarial-review`
 
 推荐用法：
 
@@ -140,6 +151,7 @@ python -m agent_orchestrator.cli team runbook <session_id>
 - `team summary`
 - `team next`
 - `team runbook`
+- `team roles`
 - `team retry-review`
 - `team retry-adversarial-review`
 - `team resume`
@@ -253,7 +265,11 @@ PYTHONPATH=src python -m agent_orchestrator.cli team check-compliance
 
 - 每次新任务先从 `team start` 开始，不要跳过 planning session。
 - 每次准备继续时先看 `team summary` 或 `team next`。
+- 每次需要确认可执行工作项时看 `team task next`。
+- 每次角色边界不清楚时看 `team roles`。
 - 每次状态不清楚时优先跑 `team runbook`。
 - 每次 delegated job 失败时优先走标准命令恢复，不要直接编辑底层 JSON。
 - 每次 execution 完成后优先跑 `team inspect-execution` 看 provenance 和结果。
+- 每次需要查看阶段沉淀时跑 `team inspect-knowledge`，它只读取 `.agent_orchestrator/knowledge/*.jsonl`。
+- `team summary` / Console payload 中的 `approval_state`、`human_intervention_reason`、`runtime_health`、`usage_cost` 是统一审批和观测入口；`usage_cost` 目前是 placeholder，除非 provider runtime 明确上报真实用量。
 - 每次 happy path 验证通过后，再推进主计划的下一实现段。

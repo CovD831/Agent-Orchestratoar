@@ -25,6 +25,7 @@ class TeamMessage:
     message_type: str
     content: str
     payload: dict[str, Any] = field(default_factory=dict)
+    thread: str = "main"
     requires_response: bool = False
     status: str = "sent"
     created_at: str = field(default_factory=now_iso)
@@ -39,6 +40,7 @@ class TeamMessage:
             "message_type": self.message_type,
             "content": self.content,
             "payload": self.payload,
+            "thread": self.thread,
             "requires_response": self.requires_response,
             "status": self.status,
             "created_at": self.created_at,
@@ -55,6 +57,7 @@ class TeamMessage:
             message_type=str(data.get("message_type") or "note"),
             content=str(data.get("content") or ""),
             payload=dict(data.get("payload", {})) if isinstance(data.get("payload"), dict) else {},
+            thread=str(data.get("thread") or _thread_from_payload(dict(data.get("payload", {})) if isinstance(data.get("payload"), dict) else {})),
             requires_response=bool(data.get("requires_response", False)),
             status=str(data.get("status") or "sent"),
             created_at=str(data.get("created_at") or now_iso()),
@@ -84,6 +87,7 @@ class MessageStore:
         content: str,
         work_unit_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        thread: str = "main",
         requires_response: bool = False,
         status: str = "sent",
     ) -> TeamMessage:
@@ -97,6 +101,7 @@ class MessageStore:
                 message_type=message_type,
                 content=content,
                 payload=payload or {},
+                thread=thread,
                 requires_response=requires_response,
                 status=status,
             )
@@ -127,6 +132,12 @@ class MessageStore:
 
     def list_for_session(self, session_id: str, *, limit: int = 100) -> list[dict[str, object]]:
         return self.query(session_id=session_id, limit=limit)
+
+    def list_threads_for_session(self, session_id: str, *, limit: int = 200) -> dict[str, list[dict[str, object]]]:
+        threads: dict[str, list[dict[str, object]]] = {}
+        for message in self.query(session_id=session_id, limit=limit):
+            threads.setdefault(str(message.get("thread") or "main"), []).append(message)
+        return threads
 
     def list_for_role(self, session_id: str, role: str, *, direction: str = "both", limit: int = 100) -> list[dict[str, object]]:
         if direction == "inbox":
@@ -182,6 +193,7 @@ class MessageRouter:
             message_type="review_request",
             content=content,
             payload=payload,
+            thread="review",
             requires_response=True,
         )
 
@@ -202,6 +214,7 @@ class MessageRouter:
             message_type="review_result",
             content=content,
             payload=payload,
+            thread="review",
             requires_response=False,
         )
 
@@ -224,5 +237,19 @@ class MessageRouter:
             message_type="handoff",
             content=content,
             payload=payload,
+            thread=_thread_from_payload(payload or {}),
             requires_response=requires_response,
         )
+
+
+def _thread_from_payload(payload: dict[str, Any]) -> str:
+    explicit = payload.get("thread")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    round_type = str(payload.get("round_type") or "")
+    artifact_kind = str(payload.get("artifact_kind") or "")
+    if "review" in round_type or artifact_kind == "review_findings":
+        return "review"
+    if artifact_kind in {"execution_result", "runtime_handoff"} or payload.get("run_id"):
+        return "rescue" if payload.get("status") == "blocked" else "main"
+    return "main"

@@ -24,7 +24,7 @@ from agent_orchestrator.guards import (
 from agent_orchestrator.command import ProviderHealthCheck, ProviderStatus
 from agent_orchestrator.events import EventStore
 from agent_orchestrator.ideation import run_ideation
-from agent_orchestrator.memory import MemoryStore
+from agent_orchestrator.memory import KnowledgeStore, MemoryStore
 from agent_orchestrator.messages import MessageRouter, MessageStore
 from agent_orchestrator.orchestrator import Orchestrator
 from agent_orchestrator.policies import OrchestrationMode, get_policy
@@ -51,9 +51,10 @@ from agent_orchestrator.planning_support import (
 from agent_orchestrator.review import Finding, ReviewResult
 from agent_orchestrator.tasks import ExecutionContract
 from agent_orchestrator.topology import TopologyName
-from agent_orchestrator.work_graph import WorkGraphStore, build_initial_work_graph
+from agent_orchestrator.work_graph import WorkGraphStore, build_initial_work_graph, next_executable_node
 
 TeamRole = Literal["lead", "build", "review"]
+ExecutionContextPolicy = Literal["fresh", "resume", "resume_if_same_task"]
 GapStatus = Literal["open", "acknowledged", "closed"]
 PlanSessionStatus = Literal[
     "intake_chat",
@@ -103,6 +104,7 @@ class PlanStatusSummary(TypedDict):
     primary_action: str
     primary_reason: str
     recommended_commands: list[str]
+    next_executable_task: dict[str, object] | None
     recovery_actions: list[str]
     recovery_round_type: str | None
     recovery_provider: str | None
@@ -125,6 +127,7 @@ class PlanStatusSummary(TypedDict):
     decision_rationale: list[str]
     approved_plan_ready: bool
     approved_plan_source: str | None
+    execution_context_policy: dict[str, object]
 
 
 class BlockerEvidenceFailedJob(TypedDict):
@@ -760,6 +763,9 @@ class PlanStore:
     def message_store(self) -> MessageStore:
         return MessageStore(self.root.parent / "messages")
 
+    def knowledge_store(self) -> KnowledgeStore:
+        return KnowledgeStore(self.root.parent / "knowledge")
+
     @staticmethod
     def _write_json(path: Path, payload: dict[str, object]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -949,6 +955,17 @@ class TeamOrchestrator:
         session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime)
 
         self.store.write_session(session)
+        self.store.knowledge_store().append(
+            session_id=session.id,
+            artifact_type="decisions",
+            role="lead",
+            summary=f"Started staged planning session with topology {session.structured_brief.topology_recommendation.get('recommended_topology')}.",
+            payload={
+                "status": session.status,
+                "next_task": _next_executable_task_for_session(session),
+                "decision_verdict": session.decision_verdict.to_dict() if session.decision_verdict else None,
+            },
+        )
         session.compliance = build_compliance_status_for_session(
             project_root=self.project_root,
             doc_sync=session.doc_sync,
@@ -1200,6 +1217,49 @@ class TeamOrchestrator:
         session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime)
         self.store.write_session(session)
         return session
+
+    def task_list(self, session_id: str) -> dict[str, object]:
+        session = self.store.read_session(session_id)
+        return {
+            "session_id": session.id,
+            "tasks": _task_pool_for_session(session),
+            "next_executable_task": _next_executable_task_for_session(session),
+        }
+
+    def task_next(self, session_id: str) -> dict[str, object]:
+        session = self.store.read_session(session_id)
+        next_task = _next_executable_task_for_session(session)
+        return {
+            "session_id": session.id,
+            "next_executable_task": next_task,
+            "blocked": next_task is None,
+            "blocked_by": _task_pool_blockers(session) if next_task is None else [],
+        }
+
+    def task_done(self, session_id: str, task_id: str) -> dict[str, object]:
+        session = self.store.read_session(session_id)
+        task = _find_task_for_session(session, task_id)
+        if task is None:
+            raise ValueError(f"unknown task id: {task_id}")
+        if task["status"] == "done":
+            self.store.write_session(session)
+            return {
+                "session_id": session.id,
+                "task": task,
+                "next_executable_task": _next_executable_task_for_session(session),
+            }
+        checklist_item = next((item for item in session.checklist if item.id == task_id or item.label == task_id), None)
+        if checklist_item is None:
+            raise ValueError(f"task {task_id} is not directly completable")
+        checklist_item.completed = True
+        session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
+        self.store.write_session(session)
+        updated = _find_task_for_session(session, task_id)
+        return {
+            "session_id": session.id,
+            "task": updated,
+            "next_executable_task": _next_executable_task_for_session(session),
+        }
 
     def ideate(self, requirement: str) -> PlanSession:
         session = PlanSession.new(requirement=requirement, stage_target=self.stage_target)
@@ -1484,6 +1544,13 @@ class TeamOrchestrator:
                 run_store=self.orchestrator.run_store,
                 plans_root=self.store.root,
             )
+        self.store.knowledge_store().append(
+            session_id=session.id,
+            artifact_type="decisions",
+            role="lead",
+            summary="Approved plan for execution.",
+            payload={"approved_plan_goal": session.approved_plan.get("goal") if session.approved_plan else session.requirement},
+        )
         self.store.write_session(session)
         MessageRouter(self.store.message_store()).build_handoff(
             session_id=session.id,
@@ -1549,6 +1616,7 @@ class TeamOrchestrator:
         *,
         review_policy_override: str | None = None,
         provider_health_snapshot: dict[str, object] | None = None,
+        context_policy: ExecutionContextPolicy = "resume_if_same_task",
     ) -> PlanSession:
         session = self.store.read_session(session_id)
         session.doc_sync = self._build_doc_sync_status()
@@ -1588,6 +1656,12 @@ class TeamOrchestrator:
             provider_health_snapshot=provider_health_snapshot,
         )
         payload = run.to_dict()
+        context_policy_payload = _execution_context_policy_payload(
+            session,
+            policy=context_policy,
+            run_id=run.run_id,
+            stop_reason="execution_completed" if bool(payload.get("accepted", False)) else "execution_blocked",
+        )
         metadata = dict(payload.get("metadata", {}))
         provenance = dict(metadata.get("provenance", {}))
         provenance.update(
@@ -1613,6 +1687,7 @@ class TeamOrchestrator:
                 },
                 "provider_health_snapshot": provider_health_snapshot or metadata.get("provider_health_snapshot"),
                 "provenance": provenance,
+                "execution_context_policy": context_policy_payload,
             }
         )
         payload["metadata"] = metadata
@@ -1625,6 +1700,13 @@ class TeamOrchestrator:
         session.resume.pending_role = "lead"
         session.decision_verdict = _build_decision_verdict(session, runtime=self.runtime, approval_status=lead_verdict)
         session.approved_plan = _build_approved_plan(session)
+        self.store.knowledge_store().append(
+            session_id=session.id,
+            artifact_type="lessons",
+            role="lead",
+            summary=f"Execution finished with {lead_verdict}.",
+            payload={"run_id": run.run_id, "context_policy": context_policy_payload},
+        )
         session.structured_brief.checklist_summary = _build_checklist_summary(session.checklist)
         session.doc_sync = self.refresh_documentation_sync()
         self.store.write_session(session)
@@ -1634,7 +1716,7 @@ class TeamOrchestrator:
             to_role="runtime",
             content=f"Execution started from approved plan via run {run.run_id}.",
             work_unit_id=run.run_id,
-            payload={"run_id": run.run_id, "status": session.status},
+            payload={"run_id": run.run_id, "status": session.status, "execution_context_policy": context_policy_payload},
         )
         session.compliance = build_compliance_status_for_session(
             project_root=self.project_root,
@@ -1645,6 +1727,18 @@ class TeamOrchestrator:
         )
         self.store.write_session(session)
         return session
+
+    def inspect_knowledge(self, session_id: str) -> dict[str, object]:
+        records = self.store.knowledge_store().query(session_id=session_id)
+        return {
+            "session_id": session_id,
+            "knowledge": records,
+            "counts": {
+                "decisions": sum(1 for record in records if record.get("artifact_type") == "decisions"),
+                "lessons": sum(1 for record in records if record.get("artifact_type") == "lessons"),
+                "workflow_notes": sum(1 for record in records if record.get("artifact_type") == "workflow_notes"),
+            },
+        }
 
     def inspect_execution(self, session_id: str) -> dict[str, object]:
         session = self.store.read_session(session_id)
@@ -2096,6 +2190,7 @@ def _build_execution_session_summary(session: PlanSession, payload: dict[str, ob
         "goal": approved_plan_summary.get("goal") or provenance.get("approved_plan_goal") or session.requirement,
         "selected_topology": approved_plan_summary.get("selected_topology") or provenance.get("selected_topology"),
         "selected_provider_runtime": approved_plan_summary.get("selected_provider_runtime") or provenance.get("selected_provider_runtime"),
+        "execution_context_policy": metadata.get("execution_context_policy", {}),
         "blocking_reasons": blocking_reasons,
         "warnings": warnings,
         "primary_action": guidance.primary_action,
@@ -2103,6 +2198,22 @@ def _build_execution_session_summary(session: PlanSession, payload: dict[str, ob
         "resume_action": guidance.resume_action,
         "resume_reason": guidance.resume_reason,
         "recommended_commands": guidance.recommended_commands,
+    }
+
+
+def _execution_context_policy_payload(
+    session: PlanSession,
+    *,
+    policy: ExecutionContextPolicy,
+    run_id: str | None,
+    stop_reason: str,
+) -> dict[str, object]:
+    return {
+        "policy": policy,
+        "source_session_id": session.id,
+        "resume_target": run_id if policy in {"resume", "resume_if_same_task"} else None,
+        "fresh_context": policy == "fresh",
+        "stop_reason": stop_reason,
     }
 
 
@@ -2459,6 +2570,78 @@ def _next_executable_checklist_item(checklist: list[PlanChecklistItem]) -> PlanC
         if not item.completed and all(label in completed_labels for label in item.depends_on):
             return item
     return None
+
+
+def _task_pool_for_session(session: PlanSession) -> list[dict[str, object]]:
+    completed_labels = {item.label for item in session.checklist if item.completed}
+    tasks: list[dict[str, object]] = []
+    for item in session.checklist:
+        blocked_by = [label for label in item.depends_on if label not in completed_labels]
+        tasks.append(
+            {
+                "id": item.id,
+                "title": item.label,
+                "status": "done" if item.completed else "blocked" if blocked_by else "pending",
+                "depends_on": list(item.depends_on),
+                "blocked_by": blocked_by,
+                "owner": item.owner,
+                "next_action": _task_next_action(item),
+                "validation": _task_validation_for_checklist_item(item),
+                "source": "checklist",
+            }
+        )
+    return tasks
+
+
+def _task_next_action(item: PlanChecklistItem) -> str:
+    if item.completed:
+        return "inspect"
+    if item.label == "Draft confirmed by human":
+        return "mark_draft_ready"
+    if item.label == "Review round completed":
+        return "submit_review"
+    if item.label == "Execution approved":
+        return "approve"
+    return "complete"
+
+
+def _task_validation_for_checklist_item(item: PlanChecklistItem) -> list[str]:
+    if item.label == "Draft confirmed by human":
+        return ["Human confirmed the lead draft is ready for review."]
+    if item.label == "Review round completed":
+        return ["Reviewer and adversarial reviewer findings are recorded."]
+    if item.label == "Execution approved":
+        return ["Required gaps are closed and the lead approved the execution contract."]
+    return ["Task completion is persisted in the plan checklist."]
+
+
+def _next_executable_task_for_session(session: PlanSession) -> dict[str, object] | None:
+    next_item = _next_executable_checklist_item(session.checklist)
+    if next_item is None:
+        graph = WorkGraphStore().read_optional(session.id)
+        if graph is not None:
+            return next_executable_node(graph)
+        return None
+    for task in _task_pool_for_session(session):
+        if task["id"] == next_item.id:
+            return task
+    return None
+
+
+def _find_task_for_session(session: PlanSession, task_id: str) -> dict[str, object] | None:
+    for task in _task_pool_for_session(session):
+        if task["id"] == task_id or task["title"] == task_id:
+            return task
+    return None
+
+
+def _task_pool_blockers(session: PlanSession) -> list[str]:
+    blockers: list[str] = []
+    for task in _task_pool_for_session(session):
+        blockers.extend(str(item) for item in task.get("blocked_by", []))
+    if not blockers and session.status in {"accepted", "needs_followup"}:
+        blockers.append("all checklist tasks are complete")
+    return _dedupe_preserve_order(blockers)
 
 
 def _set_checklist_completed(session: PlanSession, label: str, completed: bool) -> None:
@@ -2879,6 +3062,7 @@ def build_operator_runbook(session: PlanSession) -> list[str]:
     if session.status == "approved_for_execution":
         return [
             f"Run `{guidance.recommended_commands[0]}` to start execution from the approved plan.",
+            f"Use execution context policy `{status_summary.get('execution_context_policy', {}).get('policy', 'resume_if_same_task')}` unless the operator overrides it.",
             "Use `team status` or `team summary` if you need to confirm the session is still in the approved phase.",
             "Inspect the linked execution run after execution starts if you need deeper provenance or result details.",
         ]
@@ -2977,6 +3161,9 @@ def _build_status_summary(session: PlanSession) -> PlanStatusSummary:
         provider_mode=recovery_provider_mode,
     )
     next_checklist_item = _next_executable_checklist_item(session.checklist)
+    next_task = _next_executable_task_for_session(session)
+    execution_context_policy = _session_execution_context_policy(session)
+    approval_state = _approval_state_for_session(session, guidance)
 
     return {
         "phase": session.resume.current_phase,
@@ -2988,6 +3175,7 @@ def _build_status_summary(session: PlanSession) -> PlanStatusSummary:
         "primary_action": guidance.primary_action,
         "primary_reason": guidance.primary_reason,
         "recommended_commands": guidance.recommended_commands,
+        "next_executable_task": next_task,
         "next_executable_checklist_item": next_checklist_item.to_dict() if next_checklist_item else None,
         "checklist_dependencies": [item.to_dict() for item in session.checklist],
         "recovery_actions": guidance.recovery_actions,
@@ -3012,7 +3200,72 @@ def _build_status_summary(session: PlanSession) -> PlanStatusSummary:
         "decision_rationale": session.decision_verdict.rationale if session.decision_verdict else [],
         "approved_plan_ready": bool(session.approved_plan),
         "approved_plan_source": session.approved_plan.get("execution_contract", {}).get("source") if session.approved_plan else None,
+        "execution_context_policy": execution_context_policy,
+        "approval_state": approval_state,
+        "human_intervention_reason": _human_intervention_reason(session, guidance, blocking_reasons),
+        "runtime_health": {
+            "job_count": len(delegated_jobs),
+            "failed_job_count": sum(1 for job in delegated_jobs if job.get("status") == "failed"),
+            "linked_execution_run_id": session.resume.linked_execution_run_id,
+        },
+        "usage_cost": {
+            "available": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "estimated_cost_usd": None,
+            "source": "placeholder",
+        },
     }
+
+
+def _session_execution_context_policy(session: PlanSession) -> dict[str, object]:
+    if session.resume.linked_execution_run_id:
+        return {
+            "policy": "resume_if_same_task",
+            "source_session_id": session.id,
+            "resume_target": session.resume.linked_execution_run_id,
+            "fresh_context": False,
+            "stop_reason": "execution_completed" if session.status in {"accepted", "needs_followup"} else session.status,
+        }
+    policy = "fresh" if session.status in {"blocked", "awaiting_human"} else "resume_if_same_task"
+    return {
+        "policy": policy,
+        "source_session_id": session.id,
+        "resume_target": None,
+        "fresh_context": policy == "fresh",
+        "stop_reason": None,
+    }
+
+
+def _approval_state_for_session(session: PlanSession, guidance: SessionGuidance) -> dict[str, object]:
+    if session.status == "approved_for_execution":
+        state = "approved"
+    elif session.status in {"awaiting_human_confirmation", "awaiting_human"}:
+        state = "awaiting_human"
+    elif session.status == "needs_revision":
+        state = "needs_revision"
+    elif session.status in {"accepted", "needs_followup"}:
+        state = "completed"
+    elif session.status == "blocked":
+        state = "blocked"
+    else:
+        state = "drafting"
+    return {
+        "state": state,
+        "gate_verdict": session.gate_verdict,
+        "primary_action": guidance.primary_action,
+        "human_required": state == "awaiting_human" or guidance.primary_action in {"approve", "human_decision"},
+    }
+
+
+def _human_intervention_reason(session: PlanSession, guidance: SessionGuidance, blocking_reasons: list[str]) -> str | None:
+    if guidance.primary_action == "approve":
+        return "human_confirmation_required"
+    if guidance.primary_action == "human_decision" or session.status == "awaiting_human":
+        return "human_decision_required"
+    if blocking_reasons:
+        return "operator_recovery_required"
+    return None
 
 
 def _recovery_semantics_for_guidance(guidance: SessionGuidance) -> dict[str, object]:

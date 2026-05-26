@@ -42,6 +42,10 @@ def test_operator_runbook_doc_covers_happy_path_and_recovery() -> None:
     assert "team start" in text
     assert "team status" in text
     assert "team next" in text
+    assert "team roles" in text
+    assert "team inspect-knowledge" in text
+    assert "approval_state" in text
+    assert "required outputs" in text
     assert "team revise" in text
     assert "team approve" in text
     assert "team execute" in text

@@ -293,6 +293,11 @@ def test_print_execution_session_summary_reports_structured_fields(capsys) -> No
                 "goal": "Ship dashboard",
                 "selected_topology": "team",
                 "selected_provider_runtime": {"provider": "codex", "runtime": "command"},
+                "execution_context_policy": {
+                    "policy": "resume_if_same_task",
+                    "resume_target": "run-456",
+                    "stop_reason": "execution_completed",
+                },
                 "blocking_reasons": ["migration check pending"],
                 "warnings": ["header contract warning: src/agent_orchestrator/legacy.py has placeholder `RESPONSIBILITY` value"],
                 "primary_action": "inspect_execution",
@@ -313,6 +318,7 @@ def test_print_execution_session_summary_reports_structured_fields(capsys) -> No
     assert "goal: Ship dashboard" in out
     assert "selected_topology: team" in out
     assert 'selected_provider_runtime: {"provider": "codex", "runtime": "command"}' in out
+    assert "execution_context_policy: policy=resume_if_same_task resume_target=run-456 stop_reason=execution_completed" in out
     assert "blocking: migration check pending" in out
     assert "warnings: header contract warning: src/agent_orchestrator/legacy.py has placeholder `RESPONSIBILITY` value" in out
     assert "primary_action: inspect_execution" in out

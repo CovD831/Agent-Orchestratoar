@@ -36,6 +36,7 @@ from agent_orchestrator.orchestrator import Orchestrator
 from agent_orchestrator.policies import OrchestrationMode
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator, build_operator_runbook
 from agent_orchestrator.planning_support import repair_missing_source_headers
+from agent_orchestrator.roles import role_contracts
 from agent_orchestrator.run_store import RunStore
 
 
@@ -210,12 +211,44 @@ def main() -> None:
     team_summary.add_argument("--provider", choices=["codex", "claude"])
     team_summary.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
 
+    team_roles = team_subparsers.add_parser("roles", help="Show role contracts and skill discipline.")
+    team_roles.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_roles.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_roles.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_roles.add_argument("--provider", choices=["codex", "claude"])
+    team_roles.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
+
     team_next = team_subparsers.add_parser("next", help="Show the next recommended team command.")
     team_next.add_argument("session_id")
     team_next.add_argument("--plans-root", default=".agent_orchestrator/plans")
     team_next.add_argument("--runs-root", default=".agent_orchestrator/runs")
     team_next.add_argument("--runtime", choices=["mock", "command"], default="mock")
     team_next.add_argument("--provider", choices=["codex", "claude"])
+
+    team_task = team_subparsers.add_parser("task", help="Inspect or update plan session tasks.")
+    team_task_subparsers = team_task.add_subparsers(dest="task_command")
+    team_task_list = team_task_subparsers.add_parser("list", help="List task-pool items for a plan session.")
+    team_task_list.add_argument("session_id")
+    team_task_list.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_task_list.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_task_list.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_task_list.add_argument("--provider", choices=["codex", "claude"])
+    team_task_list.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
+    team_task_next = team_task_subparsers.add_parser("next", help="Show the next executable task for a plan session.")
+    team_task_next.add_argument("session_id")
+    team_task_next.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_task_next.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_task_next.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_task_next.add_argument("--provider", choices=["codex", "claude"])
+    team_task_next.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
+    team_task_done = team_task_subparsers.add_parser("done", help="Mark a task-pool checklist task as done.")
+    team_task_done.add_argument("session_id")
+    team_task_done.add_argument("task_id")
+    team_task_done.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_task_done.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_task_done.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_task_done.add_argument("--provider", choices=["codex", "claude"])
+    team_task_done.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
 
     team_runbook = team_subparsers.add_parser("runbook", help="Show operator guidance for the current plan session.")
     team_runbook.add_argument("session_id")
@@ -328,6 +361,7 @@ def main() -> None:
     team_execute.add_argument("--runtime", choices=["mock", "command"], default="mock")
     team_execute.add_argument("--provider", choices=["codex", "claude"])
     team_execute.add_argument("--review-policy", choices=REVIEW_POLICY_CHOICES, default="auto")
+    team_execute.add_argument("--context-policy", choices=["fresh", "resume", "resume_if_same_task"], default="resume_if_same_task")
 
     team_setup = team_subparsers.add_parser("setup", help="Inspect provider/runtime and workflow readiness.")
     team_setup.add_argument("--plans-root", default=".agent_orchestrator/plans")
@@ -358,6 +392,17 @@ def main() -> None:
     team_inspect_blockers.add_argument("--runtime", choices=["mock", "command"], default="mock")
     team_inspect_blockers.add_argument("--provider", choices=["codex", "claude"])
     team_inspect_blockers.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
+
+    team_inspect_knowledge = team_subparsers.add_parser(
+        "inspect-knowledge",
+        help="Show decisions, lessons, and workflow notes for a plan session.",
+    )
+    team_inspect_knowledge.add_argument("session_id")
+    team_inspect_knowledge.add_argument("--plans-root", default=".agent_orchestrator/plans")
+    team_inspect_knowledge.add_argument("--runs-root", default=".agent_orchestrator/runs")
+    team_inspect_knowledge.add_argument("--runtime", choices=["mock", "command"], default="mock")
+    team_inspect_knowledge.add_argument("--provider", choices=["codex", "claude"])
+    team_inspect_knowledge.add_argument("--format", choices=FORMAT_CHOICES, default="pretty")
     args = parser.parse_args()
 
     if args.command == "health":
@@ -408,8 +453,27 @@ def main() -> None:
             else:
                 _print_team_summary(session)
             return
+        if args.team_command == "roles":
+            payload = _team_role_contract_payload()
+            if not _json_only(args):
+                _print_team_role_contracts(payload)
+            _emit_json(payload, args)
+            return
         if args.team_command == "next":
             _print_team_next(team.status(args.session_id), args)
+            return
+        if args.team_command == "task":
+            if args.task_command == "list":
+                payload = team.task_list(args.session_id)
+            elif args.task_command == "next":
+                payload = team.task_next(args.session_id)
+            elif args.task_command == "done":
+                payload = team.task_done(args.session_id, args.task_id)
+            else:
+                parser.error("a team task subcommand is required")
+            if not _json_only(args):
+                _print_team_task_payload(payload)
+            _emit_json(payload, args)
             return
         if args.team_command == "runbook":
             _print_team_runbook(team.status(args.session_id))
@@ -493,6 +557,7 @@ def main() -> None:
                         mode,
                         review_policy_override=getattr(args, "review_policy", "auto"),
                         provider_health_snapshot=health_snapshot,
+                        context_policy=getattr(args, "context_policy", "resume_if_same_task"),
                     ).to_dict(),
                     ensure_ascii=False,
                     indent=2,
@@ -515,6 +580,12 @@ def main() -> None:
             payload = team.inspect_blockers(args.session_id)
             if not _json_only(args):
                 _print_blocker_session_summary(payload)
+            _emit_json(payload, args)
+            return
+        if args.team_command == "inspect-knowledge":
+            payload = team.inspect_knowledge(args.session_id)
+            if not _json_only(args):
+                _print_knowledge_summary(payload)
             _emit_json(payload, args)
             return
         parser.error("a team subcommand is required")
@@ -855,6 +926,66 @@ def _print_execution_session_summary(payload: dict[str, object]) -> None:
 
 def _print_blocker_session_summary(payload: dict[str, object]) -> None:
     _print_blocker_session_summary_presenter(payload)
+
+
+def _print_team_task_payload(payload: dict[str, object]) -> None:
+    print(f"session: {payload.get('session_id')}")
+    tasks = payload.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            blocked_by = task.get("blocked_by", [])
+            blocked_text = f" blocked_by={','.join(str(item) for item in blocked_by)}" if blocked_by else ""
+            print(
+                "task: "
+                f"{task.get('id')} status={task.get('status')} owner={task.get('owner')} "
+                f"next_action={task.get('next_action')} title={task.get('title')}{blocked_text}"
+            )
+    next_task = payload.get("next_executable_task")
+    if isinstance(next_task, dict):
+        print(
+            "next_task: "
+            f"{next_task.get('id')} action={next_task.get('next_action')} title={next_task.get('title')}"
+        )
+    elif payload.get("blocked"):
+        blocked_by = payload.get("blocked_by", [])
+        print(f"blocked_by: {', '.join(str(item) for item in blocked_by) if blocked_by else 'none'}")
+
+
+def _team_role_contract_payload() -> dict[str, object]:
+    contracts = [contract.to_dict() for contract in role_contracts()]
+    return {
+        "roles": contracts,
+        "contract_count": len(contracts),
+        "skill_discipline": "role contracts bind allowed actions, forbidden actions, required outputs, and command refs",
+    }
+
+
+def _print_team_role_contracts(payload: dict[str, object]) -> None:
+    print(f"role_contracts: {payload.get('contract_count', 0)}")
+    for contract in payload.get("roles", []):
+        if not isinstance(contract, dict):
+            continue
+        print(
+            "role: "
+            f"{contract.get('role')} runtime_mode={contract.get('runtime_mode')} "
+            f"allowed={','.join(str(item) for item in contract.get('allowed_actions', []))} "
+            f"required_outputs={','.join(str(item) for item in contract.get('required_outputs', []))}"
+        )
+
+
+def _print_knowledge_summary(payload: dict[str, object]) -> None:
+    print(f"session: {payload.get('session_id')}")
+    counts = payload.get("counts", {}) if isinstance(payload.get("counts"), dict) else {}
+    print(
+        "knowledge: "
+        f"decisions={counts.get('decisions', 0)} lessons={counts.get('lessons', 0)} "
+        f"workflow_notes={counts.get('workflow_notes', 0)}"
+    )
+    for record in payload.get("knowledge", [])[:5]:
+        if isinstance(record, dict):
+            print(f"- {record.get('artifact_type')}: {record.get('summary')}")
 
 
 def _team_setup_snapshot(team: TeamOrchestrator, args: argparse.Namespace) -> dict[str, object]:

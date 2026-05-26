@@ -233,6 +233,14 @@ def print_execution_session_summary(payload: dict[str, object]) -> None:
     selected_provider_runtime = summary.get("selected_provider_runtime")
     if selected_provider_runtime:
         print(f"selected_provider_runtime: {json.dumps(selected_provider_runtime, ensure_ascii=False)}")
+    context_policy = summary.get("execution_context_policy")
+    if isinstance(context_policy, dict) and context_policy:
+        print(
+            "execution_context_policy: "
+            f"policy={context_policy.get('policy')} "
+            f"resume_target={context_policy.get('resume_target')} "
+            f"stop_reason={context_policy.get('stop_reason')}"
+        )
     blocking_reasons = summary_list(summary, "blocking_reasons")
     if blocking_reasons:
         print(f"blocking: {'; '.join(str(reason) for reason in blocking_reasons)}")
@@ -365,6 +373,12 @@ def print_team_next(
     print(f"action: {primary_action}")
     print(f"reason: {context['primary_reason']}")
     print(f"next_command: {command}")
+    next_task = status.get("next_executable_task")
+    if isinstance(next_task, dict):
+        print(
+            "next_task: "
+            f"{next_task.get('id')} action={next_task.get('next_action')} title={next_task.get('title')}"
+        )
     print_recovery_details(status, include_commands=True)
     if alternatives:
         print(f"alternatives: {', '.join(alternatives)}")

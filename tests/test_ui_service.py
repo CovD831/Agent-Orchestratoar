@@ -41,6 +41,7 @@ def test_dashboard_lists_sessions_and_builds_detail(tmp_path) -> None:
     assert draft_action["state_changes"]
     assert detail["events"]
     assert detail["messages"]["count"] >= 2
+    assert detail["messages"]["threads"].get("main", 0) >= 1
     assert detail["evidence_summary"]["memory_record_count"] >= 1
     assert detail["evidence_summary"]["recent_memory"]
     assert "retrieved_memory" in detail["evidence_summary"]
@@ -54,8 +55,11 @@ def test_dashboard_lists_sessions_and_builds_detail(tmp_path) -> None:
     assert detail["operator_summary"]["session"]["id"] == session["id"]
     assert detail["operator_summary"]["review_policy"]["policy_name"]
     assert "fallback_snapshot" in detail["operator_summary"]
+    assert detail["operator_summary"]["approval_observability"]["approval_state"]["state"] == "drafting"
+    assert detail["operator_summary"]["approval_observability"]["usage_cost"]["source"] == "placeholder"
     assert detail["operator_summary"]["compliance_snapshot"]["status"] in {"passed", "warning", "blocked", "unknown"}
     assert detail["operator_summary"]["message_timeline"]
+    assert "thread" in detail["operator_summary"]["message_timeline"][0]
     assert detail["plan_tree"]["kind"] == "session"
     assert detail["plan_tree"]["children"]
     assert detail["evidence_summary"]["review_round_count"] >= 1

@@ -154,6 +154,11 @@ The first product-quality version should be able to:
 - Runs a fixed dual-model planning loop: author draft, adversarial review, decision verdict.
 - Persists plan sessions, review rounds, checklist state, and resume metadata for the `team` workflow.
 - Exposes session-centric operator guidance through `team summary`, `team next`, and `team runbook`.
+- Exposes task-pool visibility through `team task list`, `team task next`, and `team task done`.
+- Exposes role-contract discipline through `team roles`.
+- Records execution context policy (`fresh`, `resume`, `resume_if_same_task`) in execution metadata.
+- Persists lightweight knowledge artifacts through `team inspect-knowledge`.
+- Surfaces approval state, human-intervention reason, runtime health, and usage/cost placeholders in operator payloads.
 - Decomposes the approved plan into execution-ready work units.
 - Executes approved team plans from approved-plan artifacts rather than re-deriving from the raw requirement.
 - Routes execution through a policy profile.
@@ -174,6 +179,8 @@ The intended module boundary is:
   - reviewer and adversarial reviewer loops
   - plan artifact persistence
   - checklist tracking
+  - task pool and next executable task visibility
+  - role contracts and required outputs
   - resume metadata
   - documentation synchronization checks
 - `Execution Strategy Layer`

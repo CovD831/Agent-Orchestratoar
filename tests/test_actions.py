@@ -3,6 +3,7 @@ import pytest
 from agent_orchestrator.actions import assert_session_action_allowed, build_session_actions, primary_action_from_registry
 from agent_orchestrator import Orchestrator
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator
+from agent_orchestrator.roles import role_contracts
 from test_support import start_approved_session, start_executed_session
 
 
@@ -59,3 +60,14 @@ def test_action_registry_maps_completed_session_to_inspect_execution(tmp_path) -
 
     assert actions["inspect_execution"]["enabled"] is True
     assert primary["primary_action"] == "inspect_execution"
+
+
+def test_role_contracts_bind_skill_discipline() -> None:
+    contracts = {contract.role: contract for contract in role_contracts()}
+
+    assert contracts["reviewer"].runtime_mode == "direct_api"
+    assert "execute_work_unit" in contracts["reviewer"].forbidden_actions
+    assert "review_findings" in contracts["reviewer"].required_outputs
+    assert "team retry-review" in contracts["reviewer"].command_refs
+    assert contracts["builder"].runtime_mode == "cli_inherit"
+    assert "implementation_result" in contracts["builder"].required_outputs

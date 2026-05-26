@@ -1,5 +1,5 @@
 from agent_orchestrator import Orchestrator
-from agent_orchestrator.memory import MemoryStore
+from agent_orchestrator.memory import KnowledgeStore, MemoryStore
 from agent_orchestrator.planning import PlanStore, TeamOrchestrator
 
 
@@ -62,3 +62,15 @@ def test_plan_store_writes_session_snapshot_memory(tmp_path) -> None:
 
     assert records
     assert any(record["record_type"] == "session_snapshot" for record in records)
+
+
+def test_knowledge_store_appends_type_scoped_jsonl(tmp_path) -> None:
+    store = KnowledgeStore(tmp_path / "knowledge")
+
+    store.append(session_id="plan-1", artifact_type="decisions", summary="approved", payload={"status": "approved"})
+    store.append(session_id="plan-1", artifact_type="lessons", summary="validated")
+
+    records = store.query(session_id="plan-1")
+
+    assert {record["artifact_type"] for record in records} == {"decisions", "lessons"}
+    assert (tmp_path / "knowledge" / "decisions.jsonl").exists()

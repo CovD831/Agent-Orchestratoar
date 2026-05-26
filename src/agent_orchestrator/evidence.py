@@ -349,6 +349,11 @@ def _capture_case(
     session = team.submit_draft_for_review(session.id)
     required_open = [gap.id for gap in session.gaps if gap.required and gap.status != "closed"]
     if required_open:
+        session.status = "needs_revision"
+        session.gate_verdict = "needs_revision"
+        session.resume.current_phase = "in_review"
+        session.resume.pending_role = "lead"
+        team.store.write_session(session)
         session = team.revise(session.id, summary="Evidence capture closes required review gaps.", closed_gap_ids=required_open)
     if session.status != "approved_for_execution":
         session = team.approve(session.id)
@@ -420,6 +425,9 @@ def _capture_case(
             "recommended_commands": list(team_summary.get("recommended_commands", [])),
             "recovery_actions": list(team_summary.get("recovery_actions", [])),
             "execution_provenance_keys": sorted(provenance.keys()),
+            "approval_state": team_summary.get("approval_state", {}),
+            "runtime_health": team_summary.get("runtime_health", {}),
+            "usage_cost": team_summary.get("usage_cost", {}),
         },
         "signals": signals,
         "comparison": {
@@ -669,6 +677,18 @@ def _team_advantages(
         advantages.append("execution_provenance")
     if status_summary.get("recommended_commands"):
         advantages.append("recovery_guidance")
+    if status_summary.get("next_executable_task"):
+        advantages.append("task_next_visibility")
+    if status_summary.get("approval_state"):
+        advantages.append("approval_observability")
+    if status_summary.get("execution_context_policy"):
+        advantages.append("fresh_resume_policy")
+    if status_summary.get("usage_cost"):
+        advantages.append("usage_cost_placeholder")
+    if getattr(session, "id", None):
+        advantages.append("knowledge_artifacts")
+    if session.review_rounds:
+        advantages.append("role_contract_enforced")
     if session.decision_verdict is not None and session.decision_verdict.selected_provider_runtime:
         advantages.append("provider_runtime_selection")
         selected = session.decision_verdict.selected_provider_runtime
@@ -727,6 +747,7 @@ def _build_summary(cases: list[dict[str, object]]) -> dict[str, object]:
             else 0.0
         ),
         "signal_counts": _signal_counts(signals),
+        "reference_advantage_counts": _tag_counts(comparisons, "team_advantages"),
     }
 
 

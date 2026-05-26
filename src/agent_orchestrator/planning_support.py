@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_orchestrator.jobs import FileJobRuntime, JobRuntime
+from agent_orchestrator.roles import role_contracts
 
 if TYPE_CHECKING:
     from agent_orchestrator.planning import PlanReviewRound, PlanSession
@@ -739,6 +740,7 @@ def build_compliance_status_for_session(
             "team next",
             "team runbook",
             "team resume",
+            "team roles",
             "team inspect-blockers",
             "team inspect-execution",
             "team retry-review",
@@ -762,6 +764,7 @@ def build_compliance_status_for_session(
             baseline_reasons.append("operator runbook missing topology/fallback signals")
         if any(command not in runbook_text for command in required_guidance_commands):
             baseline_reasons.append("operator runbook missing canonical guidance commands")
+        baseline_reasons.extend(_role_contract_issues(runbook_text))
         if "module manifests" not in root_map_text:
             baseline_reasons.append("root map missing module manifest linkage")
         if "file-header contract" not in manifest_text:
@@ -905,6 +908,17 @@ def build_compliance_status_for_session(
                 "name": "managed_git_hooks_declared",
                 "status": "warning" if hook_marker_warnings else "passed",
                 "details": "managed hook marker and installed pre-commit hook are current",
+            },
+            {
+                "name": "role_contracts_current",
+                "status": (
+                    "failed"
+                    if any(str(reason).startswith("role contract drift:") for reason in blocking_reasons)
+                    else "warning"
+                    if any(str(reason).startswith("role contract drift:") for reason in warnings)
+                    else "passed"
+                ),
+                "details": "role contracts document command refs and discipline boundaries",
             },
         ],
         "blocking_reasons": blocking_reasons,
@@ -1433,6 +1447,19 @@ def _resume_guidance_command(session_id: str, action: str) -> str:
     if action == "revise":
         return f"python -m agent_orchestrator.cli team next {session_id}"
     return f"python -m agent_orchestrator.cli team summary {session_id}"
+
+
+def _role_contract_issues(runbook_text: str) -> list[str]:
+    issues: list[str] = []
+    if "team roles" not in runbook_text:
+        issues.append("role contract drift: operator runbook missing team roles command")
+    for contract in role_contracts():
+        if contract.role not in runbook_text:
+            issues.append(f"role contract drift: operator runbook missing {contract.role} role")
+        for command in contract.command_refs:
+            if command not in runbook_text:
+                issues.append(f"role contract drift: operator runbook missing {contract.role} command ref {command}")
+    return issues
 
 
 def compliance_blocking_reasons(session: PlanSession) -> list[str]:

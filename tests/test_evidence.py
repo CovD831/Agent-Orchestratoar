@@ -47,8 +47,14 @@ def test_capture_workflow_evidence_records_team_advantages_and_writes_json(tmp_p
     assert "recovery_guidance" in case["comparison"]["team_advantages"]
     assert "doc_sync_snapshot" in case["comparison"]["team_advantages"]
     assert "fallback_signal_surface" in case["comparison"]["team_advantages"]
+    assert "approval_observability" in case["comparison"]["team_advantages"]
+    assert "fresh_resume_policy" in case["comparison"]["team_advantages"]
+    assert "knowledge_artifacts" in case["comparison"]["team_advantages"]
+    assert "role_contract_enforced" in case["comparison"]["team_advantages"]
     assert "no_approved_plan_artifact" in case["comparison"]["direct_limitations"]
     assert case["team_workflow"]["approved_plan_source"] == "approved_plan_session"
+    assert case["team_workflow"]["approval_state"]["state"] in {"completed", "approved"}
+    assert case["team_workflow"]["usage_cost"]["source"] == "placeholder"
     assert case["comparison"]["benefit_score"] >= 4
     assert case["signals"]["provenance"]["present"] is True
     assert case["signals"]["provenance"]["matches_plan_session"] is True
@@ -57,6 +63,7 @@ def test_capture_workflow_evidence_records_team_advantages_and_writes_json(tmp_p
     assert case["signals"]["doc_sync"]["status"] == "passed"
     assert case["signals"]["fallback"]["present"] in {True, False}
     assert payload["report"]["cases_with_recovery_guidance"] == 1
+    assert payload["summary"]["reference_advantage_counts"]["approval_observability"] == 1
     assert payload["summary"]["average_benefit_score"] >= 4
     assert payload["summary"]["signal_counts"]["provenance_matches_plan_session"] == 1
     assert payload["summary"]["signal_counts"]["doc_sync_present"] == 1

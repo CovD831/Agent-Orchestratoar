@@ -27,6 +27,7 @@ def test_message_store_appends_and_queries_by_session_and_role(tmp_path) -> None
     assert len(store.list_for_session("plan-1")) == 2
     assert store.query(session_id="plan-1", to_role="reviewer")[0]["content"] == "please review"
     assert store.list_for_role("plan-1", "lead", direction="outbox")[0]["message_type"] == "review_request"
+    assert store.list_for_session("plan-1")[0]["thread"] == "main"
 
 
 def test_message_router_builds_review_request_result_and_handoff(tmp_path) -> None:
@@ -39,6 +40,9 @@ def test_message_router_builds_review_request_result_and_handoff(tmp_path) -> No
     assert request.requires_response is True
     assert result.to_role == "lead"
     assert handoff.message_type == "handoff"
+    assert request.thread == "review"
+    assert result.thread == "review"
+    assert handoff.thread == "main"
 
 
 def test_team_start_writes_review_messages_and_job_metadata(tmp_path) -> None:
@@ -59,6 +63,7 @@ def test_team_start_writes_review_messages_and_job_metadata(tmp_path) -> None:
 
     assert len(review_requests) == 2
     assert len(review_results) == 2
+    assert {message["thread"] for message in review_requests} == {"review"}
     assert {message["to_role"] for message in review_requests} == {"reviewer", "adversarial_reviewer"}
 
     jobs = team.runtime.list_recent()

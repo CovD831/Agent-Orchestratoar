@@ -146,3 +146,60 @@ class MemoryStore:
             if isinstance(payload, dict):
                 records.append(MemoryRecord.from_dict(payload))
         return records
+
+
+@dataclass(slots=True)
+class KnowledgeStore:
+    root: Path | str = ".agent_orchestrator/knowledge"
+
+    def __post_init__(self) -> None:
+        self.root = Path(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def append(
+        self,
+        *,
+        session_id: str,
+        artifact_type: str,
+        summary: str,
+        role: str = "lead",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
+        record = {
+            "id": f"knowledge-{uuid4().hex[:10]}",
+            "session_id": session_id,
+            "artifact_type": artifact_type,
+            "role": role,
+            "summary": summary,
+            "payload": payload or {},
+            "created_at": now_iso(),
+        }
+        path = self._path_for_type(artifact_type)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+    def query(self, *, session_id: str | None = None, artifact_type: str | None = None, limit: int = 100) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        paths = [self._path_for_type(artifact_type)] if artifact_type else sorted(self.root.glob("*.jsonl"))
+        for path in paths:
+            if not path.exists():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if session_id is not None and payload.get("session_id") != session_id:
+                    continue
+                records.append(payload)
+        records.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+        return records[:limit]
+
+    def _path_for_type(self, artifact_type: str | None) -> Path:
+        safe_type = (artifact_type or "notes").replace("/", "_")
+        return self.root / f"{safe_type}.jsonl"

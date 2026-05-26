@@ -37,6 +37,26 @@ class AgentRole:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RoleContract:
+    role: str
+    runtime_mode: str
+    allowed_actions: list[str]
+    forbidden_actions: list[str]
+    required_outputs: list[str]
+    command_refs: list[str]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "role": self.role,
+            "runtime_mode": self.runtime_mode,
+            "allowed_actions": list(self.allowed_actions),
+            "forbidden_actions": list(self.forbidden_actions),
+            "required_outputs": list(self.required_outputs),
+            "command_refs": list(self.command_refs),
+        }
+
+
 LAYER_LABELS: dict[AgentLayer, str] = {
     "decision": "决策层",
     "execution": "执行层",
@@ -164,3 +184,51 @@ def role_for_work_unit_kind(kind: str) -> AgentRole:
     if normalized == "execution_run":
         return DEFAULT_AGENT_ROLES["runtime"]
     return DEFAULT_AGENT_ROLES["planner"]
+
+
+ROLE_CONTRACTS: dict[str, RoleContract] = {
+    "planner": RoleContract(
+        role="planner",
+        runtime_mode="direct_api",
+        allowed_actions=["draft_plan", "respond_to_user"],
+        forbidden_actions=["execute_work_unit", "write_review_findings"],
+        required_outputs=["structured_brief", "checklist", "next_executable_task"],
+        command_refs=["team start", "team chat", "team draft-ready", "team task next"],
+    ),
+    "reviewer": RoleContract(
+        role="reviewer",
+        runtime_mode="direct_api",
+        allowed_actions=["write_review_findings"],
+        forbidden_actions=["execute_work_unit", "approve_plan"],
+        required_outputs=["review_findings", "required_gaps", "followup_gaps"],
+        command_refs=["team submit-review", "team retry-review", "team task list"],
+    ),
+    "adversarial_reviewer": RoleContract(
+        role="adversarial_reviewer",
+        runtime_mode="direct_api",
+        allowed_actions=["write_review_findings"],
+        forbidden_actions=["execute_work_unit", "approve_plan"],
+        required_outputs=["adversarial_findings", "risk_challenges", "gap_recommendations"],
+        command_refs=["team submit-review", "team retry-adversarial-review"],
+    ),
+    "builder": RoleContract(
+        role="builder",
+        runtime_mode="cli_inherit",
+        allowed_actions=["execute_work_unit"],
+        forbidden_actions=["approve_plan", "write_review_findings"],
+        required_outputs=["implementation_result", "targeted_validation", "changed_files"],
+        command_refs=["team execute", "team inspect-execution"],
+    ),
+    "rescue": RoleContract(
+        role="rescue",
+        runtime_mode="cli_inherit",
+        allowed_actions=["recover_session"],
+        forbidden_actions=["approve_plan", "write_review_findings"],
+        required_outputs=["rescue_summary", "retry_plan", "stop_reason"],
+        command_refs=["team inspect-blockers", "team retry-review", "team retry-adversarial-review"],
+    ),
+}
+
+
+def role_contracts() -> list[RoleContract]:
+    return [ROLE_CONTRACTS[key] for key in sorted(ROLE_CONTRACTS)]

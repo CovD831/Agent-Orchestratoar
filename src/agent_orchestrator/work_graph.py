@@ -33,6 +33,8 @@ class WorkUnitNode:
     blocked_by: list[str] = field(default_factory=list)
     message_ids: list[str] = field(default_factory=list)
     job_ids: list[str] = field(default_factory=list)
+    next_action: str = "inspect"
+    validation: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -51,6 +53,8 @@ class WorkUnitNode:
             "blocked_by": list(self.blocked_by),
             "message_ids": list(self.message_ids),
             "job_ids": list(self.job_ids),
+            "next_action": self.next_action,
+            "validation": list(self.validation),
         }
 
     @classmethod
@@ -71,6 +75,8 @@ class WorkUnitNode:
             blocked_by=[str(item) for item in data.get("blocked_by", [])],
             message_ids=[str(item) for item in data.get("message_ids", [])],
             job_ids=[str(item) for item in data.get("job_ids", [])],
+            next_action=str(data.get("next_action") or "inspect"),
+            validation=[str(item) for item in data.get("validation", [])],
         )
 
 
@@ -161,6 +167,7 @@ def build_initial_work_graph(session: Any, existing: WorkUnitGraph | None = None
             assigned_role="lead",
             acceptance_criteria=[str(item) for item in getattr(session.structured_brief, "acceptance_criteria", [])],
             allowed_actions=_node_actions_for_status(str(session.status), "session"),
+            next_action=_node_next_action(str(session.status), "session"),
             summary=str(getattr(session, "requirement", "")),
         )
     ]
@@ -177,6 +184,8 @@ def build_initial_work_graph(session: Any, existing: WorkUnitGraph | None = None
             depends_on=[root_id],
             acceptance_criteria=[str(item) for item in subtask.gate_conditions],
             allowed_actions=_node_actions_for_status(_subtask_status(session), "subtask"),
+            next_action=_node_next_action(_subtask_status(session), "subtask"),
+            validation=[str(item) for item in subtask.gate_conditions],
             summary=" / ".join(str(item) for item in subtask.expected_outputs),
         )
         nodes.append(node)
@@ -195,6 +204,8 @@ def build_initial_work_graph(session: Any, existing: WorkUnitGraph | None = None
             acceptance_criteria=[str(gap.recommendation)] if gap.recommendation else [],
             allowed_actions=_node_actions_for_status(str(gap.status), "gap"),
             blocked_by=[str(gap.id)] if gap.required and gap.status != "closed" else [],
+            next_action=_node_next_action(str(gap.status), "gap"),
+            validation=[str(gap.recommendation)] if gap.recommendation else [],
             summary=str(gap.recommendation),
         )
         nodes.append(node)
@@ -217,6 +228,7 @@ def build_initial_work_graph(session: Any, existing: WorkUnitGraph | None = None
             job_ids=[job_id] if job_id else [],
             message_ids=message_ids,
             allowed_actions=_node_actions_for_status(round_type, "review_round"),
+            next_action=_node_next_action(round_type, "review_round"),
             summary=str(round_.summary),
         )
         nodes.append(node)
@@ -234,6 +246,7 @@ def build_initial_work_graph(session: Any, existing: WorkUnitGraph | None = None
             depends_on=[root_id],
             linked_run_id=str(linked_run_id),
             allowed_actions=_node_actions_for_status(str(session.status), "execution_run"),
+            next_action=_node_next_action(str(session.status), "execution_run"),
             summary="Linked execution run from approved plan.",
         )
         nodes.append(node)
@@ -278,6 +291,8 @@ def graph_to_plan_tree(graph: WorkUnitGraph) -> dict[str, object]:
             "blocked_by": list(node.blocked_by),
             "message_ids": list(node.message_ids),
             "job_ids": list(node.job_ids),
+            "next_action": node.next_action,
+            "validation": list(node.validation),
             "schedulable": _node_schedulable(node, nodes),
             "related_agent_ids": related_agent_ids,
             "children": [build_node(child_id) for child_id in children_by_parent.get(node_id, []) if child_id in nodes],
@@ -353,6 +368,14 @@ def schedulable_nodes(graph: WorkUnitGraph) -> list[dict[str, object]]:
     return [node.to_dict() for node in graph.nodes if _node_schedulable(node, nodes)]
 
 
+def next_executable_node(graph: WorkUnitGraph) -> dict[str, object] | None:
+    schedulable = schedulable_nodes(graph)
+    for node in schedulable:
+        if node.get("kind") != "session":
+            return node
+    return schedulable[0] if schedulable else None
+
+
 def node_actions(node: WorkUnitNode) -> list[str]:
     return list(node.allowed_actions) or _node_actions_for_status(node.status, node.kind)
 
@@ -381,6 +404,11 @@ def _node_actions_for_status(status: str, kind: str) -> list[str]:
     if status in {"running", "executing", "in_review"}:
         return ["inspect", "wait"]
     return ["inspect"]
+
+
+def _node_next_action(status: str, kind: str) -> str:
+    actions = _node_actions_for_status(status, kind)
+    return actions[0] if actions else "inspect"
 
 
 def _message_ids_for_round(message_store: Any | None, session_id: str, round_id: str) -> list[str]:

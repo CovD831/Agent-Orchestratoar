@@ -554,10 +554,15 @@ def _build_role_groups(
 
 
 def _build_message_summary(messages: list[dict[str, object]]) -> dict[str, object]:
+    threads: dict[str, int] = {}
+    for message in messages:
+        thread = str(message.get("thread") or "main")
+        threads[thread] = threads.get(thread, 0) + 1
     return {
         "count": len(messages),
         "items": messages[:20],
         "latest": messages[0] if messages else None,
+        "threads": threads,
     }
 
 
@@ -813,6 +818,12 @@ def _build_operator_summary(
             "recovery_provider_fallback_reason": summary.get("recovery_provider_fallback_reason"),
             "recovery_provider_fallback_detail": summary.get("recovery_provider_fallback_detail"),
         },
+        "approval_observability": {
+            "approval_state": summary.get("approval_state"),
+            "human_intervention_reason": summary.get("human_intervention_reason"),
+            "runtime_health": summary.get("runtime_health"),
+            "usage_cost": summary.get("usage_cost"),
+        },
         "compliance_snapshot": {
             "status": compliance.get("status", "unknown"),
             "blocking": bool(compliance.get("blocking", False)),
@@ -830,6 +841,7 @@ def _build_operator_summary(
                 "from_role": message.get("from_role"),
                 "to_role": message.get("to_role"),
                 "message_type": message.get("message_type"),
+                "thread": message.get("thread"),
                 "content": message.get("content"),
             }
             for message in messages[:10]
