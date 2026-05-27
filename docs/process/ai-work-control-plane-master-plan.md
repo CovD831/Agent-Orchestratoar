@@ -246,3 +246,24 @@ Phase records:
 - `docs/process/ai-work-control-plane-provider-runtime-bridge-evaluation-phase-2-ownership-boundary.md`
 - `docs/process/ai-work-control-plane-provider-runtime-bridge-evaluation-phase-3-adapter-contract.md`
 - `docs/process/ai-work-control-plane-provider-runtime-bridge-evaluation-phase-4-pilot-selection.md`
+
+## Codex Runtime Pilot Track
+
+The next line after Provider Runtime Bridge Evaluation is the **AI Work Control Plane Codex Runtime Pilot**. It implements the first narrow real-provider adapter path without claiming a full provider bridge:
+
+```text
+codex exec --json
+  -> JSONL / final-message capture
+  -> ProviderSessionRef
+  -> RuntimeMeasurement
+  -> ProviderSessionSnapshot
+  -> WorkspaceStatus / EvidenceBundle
+```
+
+Track plan:
+
+- `docs/process/ai-work-control-plane-codex-runtime-pilot-plan.md`
+
+Phase records:
+
+- `docs/process/ai-work-control-plane-codex-runtime-pilot-phase-1-3-json-path.md`

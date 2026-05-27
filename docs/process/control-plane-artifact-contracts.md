@@ -97,8 +97,17 @@ These contracts pin the minimum stable shape for AI Work Control Plane artifacts
 - Producer: `team runtime inspect` and runtime event builder
 - Consumers: workspace status, evidence policy, UI, recovery recommendation
 - Lifecycle: generated read-only from job records and available runtime metadata
-- Stable fields: `job_id`, `task_id`, `provider`, `kind`, `status`, `phase`, `runtime_mode`, `session_id`, `thread_id`, `pid`, `command`, `home_isolation`, `liveness`, `operation_support`, `operation_receipts`, `last_operation_receipt`, `recommended_recovery_command`, `artifact_refs`, `read_only`, `created_at`
+- Stable fields: `job_id`, `task_id`, `provider`, `kind`, `status`, `phase`, `runtime_mode`, `session_id`, `thread_id`, `provider_session_ref`, `pid`, `command`, `home_isolation`, `liveness`, `operation_support`, `operation_receipts`, `last_operation_receipt`, `recommended_recovery_command`, `artifact_refs`, `read_only`, `created_at`
 - Rule: a snapshot reports fidelity; it does not claim ownership of a persistent provider session.
+
+## ProviderSessionRef
+
+- Format: `agent_orchestrator.provider_session_ref.v1`
+- Producer: provider runtime adapters when a provider-owned reference is observed
+- Consumers: provider session snapshot, runtime event stream, future provider pilots
+- Lifecycle: stored inside job parsed payloads and surfaced read-only through provider session snapshots
+- Stable fields: `job_id`, `provider`, `runtime_id`, `session_id`, `thread_id`, `cwd`, `pid`, `command`, `provider_owned`, `continuation_guarantee`, `created_at`
+- Rule: a ref points at provider/runtime state; it does not transfer ownership of that state to Agent Orchestrator.
 
 ## RuntimeOperationReceipt
 

@@ -416,19 +416,53 @@ class CodexCliAdapter:
 
     def build_command(self, request: JobRequest) -> CommandSpec:
         prompt = self.renderer.render(request)
-        return CommandSpec(
-            command=[
-                "codex",
-                "exec",
-                "--model",
-                request.model or self.default_model,
-                "--sandbox",
-                request.resolved_sandbox,
-                prompt,
-            ]
-        )
+        command = [
+            "codex",
+            "exec",
+            "--model",
+            request.model or self.default_model,
+            "--sandbox",
+            request.resolved_sandbox,
+        ]
+        pilot = _codex_pilot_metadata(request)
+        if pilot.get("json_events"):
+            command.append("--json")
+        output_last_message = pilot.get("output_last_message")
+        if isinstance(output_last_message, str) and output_last_message:
+            command.extend(["--output-last-message", output_last_message])
+        return CommandSpec(command=[*command, prompt])
 
     def parse_result(self, request: JobRequest, result: CommandResult) -> tuple[str, dict[str, Any] | None, str | None]:
+        pilot = _codex_pilot_metadata(request)
+        if pilot.get("json_events"):
+            parsed = _parse_codex_exec_jsonl(result.stdout)
+            final_message = _read_optional_text(pilot.get("output_last_message"))
+            summary = final_message or parsed.get("final_message") or result.stderr.strip() or "Codex returned no final message."
+            payload = {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "codex_exec_json": parsed,
+                "provider_session_ref": {
+                    "format": "agent_orchestrator.provider_session_ref.v1",
+                    "provider": self.provider,
+                    "runtime_id": "codex_exec_json",
+                    "session_id": parsed.get("session_id"),
+                    "thread_id": parsed.get("thread_id"),
+                    "cwd": request.cwd,
+                    "provider_owned": True,
+                    "continuation_guarantee": "provider_owned",
+                },
+                "codex_pilot": {
+                    "runtime_id": "codex_exec_json",
+                    "json_events": True,
+                    "output_last_message": pilot.get("output_last_message"),
+                    "final_message_source": "output_last_message" if final_message else parsed.get("final_message_source"),
+                    "usage_cost_policy": "placeholder unless codex reports usage directly",
+                },
+            }
+            if parsed.get("usage"):
+                payload["usage"] = parsed["usage"]
+            return summary, payload, None
         summary = result.stdout.strip() or result.stderr.strip() or "Codex returned no output."
         return summary, {"stdout": result.stdout, "stderr": result.stderr}, None
 
@@ -1094,6 +1128,104 @@ def _merge_payload(current: dict[str, Any] | None, incoming: dict[str, Any] | No
     if incoming:
         merged.update(incoming)
     return merged
+
+
+def _codex_pilot_metadata(request: JobRequest) -> dict[str, Any]:
+    pilot = request.metadata.get("codex_pilot") if isinstance(request.metadata, dict) else None
+    return dict(pilot) if isinstance(pilot, dict) else {}
+
+
+def _parse_codex_exec_jsonl(stdout: str) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    malformed_count = 0
+    final_message: str | None = None
+    final_message_source: str | None = None
+    session_id: str | None = None
+    thread_id: str | None = None
+    usage: dict[str, Any] | None = None
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            malformed_count += 1
+            continue
+        if not isinstance(event, dict):
+            malformed_count += 1
+            continue
+        events.append(event)
+        session_id = session_id or _first_text(event, "session_id", "sessionId", "conversation_id", "conversationId")
+        thread_id = thread_id or _first_text(event, "thread_id", "threadId", "conversation_id", "conversationId")
+        usage = usage or _extract_usage(event)
+        candidate = _extract_codex_final_message(event)
+        if candidate:
+            final_message = candidate
+            final_message_source = str(event.get("type") or event.get("event") or event.get("kind") or "json_event")
+    status_counts: dict[str, int] = {}
+    for event in events:
+        key = str(event.get("type") or event.get("event") or event.get("kind") or "unknown")
+        status_counts[key] = status_counts.get(key, 0) + 1
+    return {
+        "format": "agent_orchestrator.codex_exec_json.v1",
+        "event_count": len(events),
+        "malformed_event_count": malformed_count,
+        "event_types": status_counts,
+        "events": events[-20:],
+        "final_message": final_message,
+        "final_message_source": final_message_source,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "usage": usage,
+    }
+
+
+def _extract_codex_final_message(event: dict[str, Any]) -> str | None:
+    for key in ("final_message", "last_message", "message", "text", "content", "output"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    for key in ("text", "content", "message"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _first_text(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _extract_usage(event: dict[str, Any]) -> dict[str, Any] | None:
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else None
+    if usage is None:
+        return None
+    normalized = {
+        "input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens"),
+        "output_tokens": usage.get("output_tokens") or usage.get("completion_tokens"),
+        "estimated_cost_usd": usage.get("estimated_cost_usd"),
+        "source": usage.get("source") or "codex_exec_json",
+    }
+    return normalized
+
+
+def _read_optional_text(path_value: object) -> str | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    path = Path(path_value)
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
 
 
 def _normalize_provider_operation(payload: dict[str, Any], *, action: str) -> dict[str, Any]:

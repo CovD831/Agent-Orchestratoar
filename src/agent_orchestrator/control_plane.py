@@ -1661,6 +1661,7 @@ def _provider_session_snapshot_from_job(job: dict[str, object]) -> dict[str, obj
     metadata = job.get("metadata", {}) if isinstance(job.get("metadata"), dict) else {}
     parsed = job.get("parsed_payload", {}) if isinstance(job.get("parsed_payload"), dict) else {}
     operation = parsed.get("operation") if isinstance(parsed.get("operation"), dict) else None
+    provider_session_ref = parsed.get("provider_session_ref") if isinstance(parsed.get("provider_session_ref"), dict) else None
     receipts = parsed.get("runtime_operation_receipts", []) if isinstance(parsed.get("runtime_operation_receipts"), list) else []
     if operation and not any(isinstance(item, dict) and item.get("id") == operation.get("id") for item in receipts):
         receipts = [*receipts, operation]
@@ -1695,6 +1696,7 @@ def _provider_session_snapshot_from_job(job: dict[str, object]) -> dict[str, obj
         "model": job.get("model"),
         "session_id": job.get("session_id"),
         "thread_id": job.get("thread_id"),
+        "provider_session_ref": provider_session_ref,
         "pid": pid,
         "command": list(job.get("command", [])) if isinstance(job.get("command"), list) else [],
         "home_isolation": {

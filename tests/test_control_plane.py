@@ -528,6 +528,41 @@ def test_provider_session_snapshot_records_liveness_and_receipts(tmp_path) -> No
     assert payload["last_operation_receipt"]["status"] == "accepted"
 
 
+def test_provider_session_snapshot_exposes_provider_owned_ref(tmp_path) -> None:
+    runtime = FileJobRuntime(tmp_path / "jobs")
+    job = runtime.start(
+        JobRequest(
+            task_id="task-session-ref",
+            provider="codex",
+            kind="implementation",
+            prompt="build",
+            cwd=str(tmp_path),
+        )
+    )
+    runtime.complete(
+        job.id,
+        summary="done",
+        parsed_payload={
+            "provider_session_ref": {
+                "format": "agent_orchestrator.provider_session_ref.v1",
+                "provider": "codex",
+                "runtime_id": "codex_exec_json",
+                "session_id": "codex-session-1",
+                "thread_id": "codex-thread-1",
+                "provider_owned": True,
+                "continuation_guarantee": "provider_owned",
+            }
+        },
+        exit_code=0,
+    )
+
+    payload = build_provider_session_snapshot(job.id, tmp_path, jobs_root=tmp_path / "jobs")
+
+    assert payload["provider_session_ref"]["format"] == "agent_orchestrator.provider_session_ref.v1"
+    assert payload["provider_session_ref"]["runtime_id"] == "codex_exec_json"
+    assert payload["provider_session_ref"]["provider_owned"] is True
+
+
 def test_recovery_recommendation_is_read_only_and_explains_next_step(tmp_path) -> None:
     write_minimal_process_docs(tmp_path)
     team = TeamOrchestrator(

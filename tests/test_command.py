@@ -540,6 +540,98 @@ def test_codex_adapter_generates_command_spec() -> None:
     assert spec.command[:6] == ["codex", "exec", "--model", "gpt-test", "--sandbox", "workspace-write"]
 
 
+def test_codex_adapter_generates_json_pilot_command(tmp_path) -> None:
+    output_path = tmp_path / "last-message.txt"
+    adapter = CodexCliAdapter()
+    spec = adapter.build_command(
+        JobRequest(
+            task_id="work-codex-json-command",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+            model="gpt-test",
+            metadata={"codex_pilot": {"json_events": True, "output_last_message": str(output_path)}},
+        )
+    )
+
+    assert spec.command[:7] == ["codex", "exec", "--model", "gpt-test", "--sandbox", "workspace-write", "--json"]
+    assert "--output-last-message" in spec.command
+    assert str(output_path) in spec.command
+
+
+def test_codex_adapter_parses_json_pilot_output(tmp_path) -> None:
+    output_path = tmp_path / "last-message.txt"
+    output_path.write_text("final from artifact", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "session.started", "session_id": "codex-session-1"}),
+            json.dumps({"type": "message", "message": "intermediate"}),
+            json.dumps({"type": "usage", "usage": {"input_tokens": 7, "output_tokens": 3, "source": "codex"}}),
+        ]
+    )
+    adapter = CodexCliAdapter()
+    request = JobRequest(
+        task_id="work-codex-json-parse",
+        provider="codex",
+        kind="implementation",
+        prompt="Implement",
+        cwd=str(tmp_path),
+        metadata={"codex_pilot": {"json_events": True, "output_last_message": str(output_path)}},
+    )
+
+    summary, payload, error = adapter.parse_result(
+        request,
+        CommandResult(command=["codex", "exec"], exit_code=0, stdout=stdout, stderr=""),
+    )
+
+    assert summary == "final from artifact"
+    assert error is None
+    assert payload["codex_exec_json"]["event_count"] == 3
+    assert payload["codex_exec_json"]["session_id"] == "codex-session-1"
+    assert payload["provider_session_ref"]["provider_owned"] is True
+    assert payload["usage"]["source"] == "codex"
+
+
+def test_command_job_runtime_persists_codex_json_pilot_payload(tmp_path) -> None:
+    output_path = tmp_path / "codex-final.txt"
+    output_path.write_text("pilot final", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "session.started", "session_id": "codex-session-2", "thread_id": "codex-thread-2"}),
+            json.dumps({"type": "message", "message": "pilot final from json"}),
+        ]
+    )
+    runner = FakeRunner(CommandResult(command=["fake"], exit_code=0, stdout=stdout, stderr=""))
+    runtime = CommandJobRuntime(root=tmp_path / "jobs", runner=runner, adapters={"codex": CodexCliAdapter()})
+
+    job = runtime.start(
+        JobRequest(
+            task_id="work-codex-json-runtime",
+            provider="codex",
+            kind="implementation",
+            prompt="Implement",
+            cwd=str(tmp_path),
+            metadata={"codex_pilot": {"json_events": True, "output_last_message": str(output_path)}},
+        )
+    )
+
+    for _ in range(50):
+        completed = runtime.status(job.id)
+        if completed.status == "completed":
+            break
+        time.sleep(0.01)
+
+    completed = runtime.status(job.id)
+    assert completed.status == "completed"
+    assert completed.summary == "pilot final"
+    assert "--json" in completed.command
+    assert "--output-last-message" in completed.command
+    assert completed.parsed_payload["codex_pilot"]["runtime_id"] == "codex_exec_json"
+    assert completed.parsed_payload["provider_session_ref"]["session_id"] == "codex-session-2"
+    assert completed.runtime_measurement["measurement_status"] == "measured"
+
+
 def test_command_job_runtime_records_runtime_mode_metadata(tmp_path) -> None:
     runner = SessionRunner(CommandResult(command=["fake"], exit_code=0, stdout="ok", stderr=""))
     runtime = CommandJobRuntime(root=tmp_path, runner=runner, adapters={"codex": CodexCliAdapter()})
